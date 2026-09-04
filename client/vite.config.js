@@ -25,6 +25,9 @@ const guacamolePlugin = () => {
 
 export default defineConfig({
     plugins: [guacamolePlugin(), react()],
+    legacy: {
+        inconsistentCjsInterop: true,
+    },
     css: {
         preprocessorOptions: {
             sass: {
@@ -39,7 +42,10 @@ export default defineConfig({
     },
     server: {
         proxy: {
-            "/api": "http://localhost:6989",
+            "/api": {
+                target: "http://localhost:6989",
+                ws: true
+            }
         }
     }
 });

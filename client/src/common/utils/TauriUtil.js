@@ -33,11 +33,31 @@ export const waitForTauri = () => {
 
 export const isTauri = () => _isTauri ?? checkTauri();
 
+export const getTitleBarHeight = () => {
+    const value = getComputedStyle(document.body).getPropertyValue("--title-bar-height");
+    return parseInt(value) || 0;
+};
+
 export const getActiveServerUrl = () => localStorage.getItem("nexterm_server_url");
 
 export const setActiveServerUrl = (url) => {
     url ? localStorage.setItem("nexterm_server_url", url.replace(/\/$/, ""))
         : localStorage.removeItem("nexterm_server_url");
+};
+
+export const openExternalUrl = async (url) => {
+    if (!isTauri()) {
+        window.open(url, "_blank");
+        return;
+    }
+    
+    try {
+        const { invoke } = await import("@tauri-apps/api/core");
+        await invoke("open_external_url", { url });
+    } catch (e) {
+        console.warn("Failed to open external URL:", e);
+        window.open(url, "_blank");
+    }
 };
 
 waitForTauri();

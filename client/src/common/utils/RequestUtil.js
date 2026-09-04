@@ -1,4 +1,34 @@
 import { isTauri, getActiveServerUrl } from "@/common/utils/TauriUtil.js";
+import { invoke } from "@tauri-apps/api/core";
+import { save } from "@tauri-apps/plugin-dialog";
+import { writeFile } from "@tauri-apps/plugin-fs";
+import { fetch as tauriFetchApi } from "@tauri-apps/plugin-http";
+
+let cachedUserAgent = null;
+
+const getTauriUserAgent = async () => {
+    if (cachedUserAgent) return cachedUserAgent;
+    if (!isTauri()) return "NextermConnector/1.0.0";
+    try {
+        cachedUserAgent = await invoke("get_user_agent");
+        return cachedUserAgent;
+    } catch {
+        return "NextermConnector/1.0.0";
+    }
+};
+
+export const tauriDownload = async (url, defaultFileName, options = {}) => {
+    const filePath = await save({ defaultPath: defaultFileName, title: "Save File", ...options });
+    if (!filePath) return null;
+    
+    const userAgent = await getTauriUserAgent();
+    const fetchOptions = { method: "GET", ...options.fetchOptions, headers: { ...options.fetchOptions?.headers, "User-Agent": userAgent } };
+    const response = await tauriFetchApi(url, fetchOptions);
+    if (!response.ok) throw new Error(`Download failed: ${response.status}`);
+    
+    await writeFile(filePath, new Uint8Array(await response.arrayBuffer()));
+    return filePath;
+};
 
 const getBaseUrl = () => {
     if (isTauri()) {
@@ -10,16 +40,79 @@ const getBaseUrl = () => {
     return "";
 };
 
-const tauriFetch = async (url, options) => {
+export const tauriFetch = async (url, options = {}) => {
     if (isTauri()) {
         try {
-            const { fetch: tFetch } = await import("@tauri-apps/plugin-http");
-            return tFetch(url, options);
+            const userAgent = await getTauriUserAgent();
+            const headers = { ...options.headers, "User-Agent": userAgent };
+            return tauriFetchApi(url, { ...options, headers });
         } catch (e) {
             console.warn("Tauri HTTP plugin not available, falling back to native fetch");
         }
     }
     return fetch(url, options);
+};
+
+export const uploadFile = async (url, file, { onProgress, timeout = 300000, headers = {} } = {}) => {
+    const baseUrl = getBaseUrl();
+    const fullUrl = baseUrl ? `${baseUrl}${url}` : url;
+
+    if (isTauri()) {
+        try {
+            const userAgent = await getTauriUserAgent();
+            const arrayBuffer = await file.arrayBuffer();
+            
+            const response = await tauriFetchApi(fullUrl, {
+                method: "POST",
+                headers: { "Content-Type": "application/octet-stream", "User-Agent": userAgent, ...headers },
+                body: arrayBuffer,
+            });
+
+            if (onProgress) onProgress(100);
+
+            if (!response.ok) {
+                const text = await response.text();
+                let error = `Upload failed (${response.status})`;
+                try { error = JSON.parse(text).error || error; } catch {}
+                throw new Error(error);
+            }
+
+            const text = await response.text();
+            try { return JSON.parse(text); } catch { return { success: true }; }
+        } catch (e) {
+            if (e.message?.includes("Upload failed")) throw e;
+            console.warn("Tauri upload failed, trying XHR fallback:", e);
+        }
+    }
+
+    return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        
+        if (onProgress) {
+            xhr.upload.addEventListener("progress", (e) => {
+                if (e.lengthComputable) onProgress(Math.round((e.loaded / e.total) * 100));
+            });
+        }
+
+        xhr.onload = () => {
+            if (xhr.status >= 200 && xhr.status < 300) {
+                try { resolve(JSON.parse(xhr.responseText)); } catch { resolve({ success: true }); }
+            } else {
+                let errorMsg = `Upload failed (${xhr.status})`;
+                try { errorMsg = JSON.parse(xhr.responseText).error || errorMsg; } catch {}
+                reject(new Error(errorMsg));
+            }
+        };
+        xhr.onerror = () => reject(new Error("Network error"));
+        xhr.onabort = () => reject(new Error("Upload cancelled"));
+        xhr.ontimeout = () => reject(new Error("Upload timed out"));
+        xhr.timeout = timeout;
+
+        xhr.open("POST", fullUrl, true);
+        xhr.setRequestHeader("Content-Type", "application/octet-stream");
+        Object.entries(headers).forEach(([key, value]) => xhr.setRequestHeader(key, value));
+        xhr.send(file);
+    });
 };
 
 export const request = async (url, method, body, headers) => {
@@ -64,7 +157,7 @@ export const downloadRequest = async (url) => {
     return blob;
 }
 
-const getToken = () => {
+export const getToken = () => {
     return localStorage.getItem("overrideToken") || localStorage.getItem("sessionToken");
 }
 
@@ -90,4 +183,38 @@ export const deleteRequest = (url) => {
 
 export const patchRequest = (url, body) => {
     return sessionRequest(url, "PATCH", getToken(), body);
+}
+
+export const downloadFile = async (url) => {
+    url = url.startsWith("/") ? url.substring(1) : url;
+    const baseUrl = getBaseUrl();
+    const fullUrl = baseUrl ? `${baseUrl}/api/${url}` : `/api/${url}`;
+    const separator = fullUrl.includes("?") ? "&" : "?";
+    const downloadUrl = `${fullUrl}${separator}token=${encodeURIComponent(getToken())}`;
+    const fileName = url.split("?")[0].split("/").pop() || "download";
+    
+    if (isTauri()) return tauriDownload(downloadUrl, fileName);
+    
+    const a = document.createElement("a");
+    a.href = downloadUrl;
+    a.download = "";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+}
+
+export const getRawRequest = async (url) => {
+    url = url.startsWith("/") ? url.substring(1) : url;
+    const baseUrl = getBaseUrl();
+    const fullUrl = baseUrl ? `${baseUrl}/api/${url}` : `/api/${url}`;
+    
+    const response = await tauriFetch(fullUrl, {
+        method: "GET",
+        headers: { "Authorization": `Bearer ${getToken()}` },
+    });
+
+    if (response.status === 401) throw new Error("Unauthorized");
+    if (!response.ok) throw new Error("Request failed");
+
+    return response;
 }

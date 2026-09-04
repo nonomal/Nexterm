@@ -1,7 +1,13 @@
 const Organization = require("../models/Organization");
 const OrganizationMember = require("../models/OrganizationMember");
+const OrganizationMemberPermission = require("../models/OrganizationMemberPermission");
 const Account = require("../models/Account");
+const { hasOrganizationPermission, getOrganizationPermissions } = require("../permissions/engine");
+const { Permission } = require("../permissions/registry");
+const stateBroadcaster = require("../lib/StateBroadcaster");
+const { revokeLiveSessionAccess } = require("./liveSession");
 const { Op } = require("sequelize");
+const { ACCOUNT_VIEW_ATTRIBUTES, toAccountView } = require("../utils/accountView");
 
 module.exports.createOrganization = async (accountId, configuration) => {
     const organization = await Organization.create({
@@ -26,15 +32,13 @@ module.exports.deleteOrganization = async (accountId, organizationId) => {
     const orgId = parseInt(organizationId, 10);
     if (isNaN(orgId) || orgId <= 0) return { code: 400, message: "Invalid organization ID" };
 
-    const membership = await OrganizationMember.findOne({
-        where: { organizationId: orgId, accountId, status: "active", role: "owner" },
-    });
-
-    if (!membership) {
+    const canManage = await hasOrganizationPermission(accountId, orgId, Permission.ORG_DELETE);
+    if (!canManage) {
         return { code: 403, message: "You don't have permission to delete this organization or it doesn't exist" };
     }
 
     await OrganizationMember.destroy({ where: { organizationId } });
+    await OrganizationMemberPermission.destroy({ where: { organizationId } });
 
     await Organization.destroy({ where: { id: organizationId } });
 
@@ -47,11 +51,8 @@ module.exports.updateOrganization = async (accountId, organizationId, updates) =
         return { code: 400, message: "Invalid organization ID" };
     }
 
-    const membership = await OrganizationMember.findOne({
-        where: { organizationId: orgId, accountId, status: "active", role: "owner" },
-    });
-
-    if (!membership) {
+    const canManage = await hasOrganizationPermission(accountId, orgId, Permission.ORG_MANAGE);
+    if (!canManage) {
         return { code: 403, message: "You don't have permission to update this organization" };
     }
 
@@ -79,10 +80,11 @@ module.exports.listOrganizations = async (accountId) => {
     const organizationIds = memberships.map(m => m.organizationId);
 
     const organizations = await Organization.findAll({ where: { id: { [Op.in]: organizationIds } } });
-    return organizations.map(org => {
-        const membership = memberships.find(m => m.organizationId === org.id);
-        return { ...org, isOwner: membership.role === "owner" };
-    });
+
+    return Promise.all(organizations.map(async (org) => {
+        const { isOwner, isAdmin, permissions } = await getOrganizationPermissions(accountId, org.id);
+        return { ...org, isOwner: isOwner || isAdmin, permissions };
+    }));
 };
 
 module.exports.listPendingInvitations = async (accountId) => {
@@ -95,7 +97,7 @@ module.exports.listPendingInvitations = async (accountId) => {
     const inviterIds = [...new Set(pendingInvites.map(invite => invite.invitedBy))];
     const inviters = await Account.findAll({
         where: { id: { [Op.in]: inviterIds } },
-        attributes: ["id", "firstName", "lastName", "username"],
+        attributes: ACCOUNT_VIEW_ATTRIBUTES,
     });
 
     return pendingInvites.map(invite => {
@@ -106,9 +108,8 @@ module.exports.listPendingInvitations = async (accountId) => {
             id: invite.id,
             organization: { id: org.id, name: org.name, description: org.description },
             invitedBy: {
-                id: inviter.id,
+                ...toAccountView(inviter),
                 name: `${inviter.firstName} ${inviter.lastName}`,
-                username: inviter.username,
             },
             createdAt: invite.createdAt,
         };
@@ -119,11 +120,8 @@ module.exports.inviteUser = async (accountId, organizationId, username) => {
     const orgId = parseInt(organizationId, 10);
     if (isNaN(orgId) || orgId <= 0) return { code: 400, message: "Invalid organization ID" };
 
-    const membership = await OrganizationMember.findOne({
-        where: { organizationId: orgId, accountId, status: "active", role: "owner" },
-    });
-
-    if (!membership) return { code: 403, message: "You don't have permission to invite users to this organization" };
+    const canManage = await hasOrganizationPermission(accountId, orgId, Permission.ORG_MEMBERS_MANAGE);
+    if (!canManage) return { code: 403, message: "You don't have permission to invite users to this organization" };
     const invitedUser = await Account.findOne({ where: { username: username } });
 
     if (!invitedUser) return { code: 404, message: "User not found" };
@@ -172,11 +170,8 @@ module.exports.removeMember = async (accountId, organizationId, memberAccountId)
     if (isNaN(orgId) || orgId <= 0) return { code: 400, message: "Invalid organization ID" };
     if (isNaN(memberId) || memberId <= 0) return { code: 400, message: "Invalid member account ID" };
 
-    const membership = await OrganizationMember.findOne({
-        where: { organizationId: orgId, accountId, status: "active", role: "owner" },
-    });
-
-    if (!membership) {
+    const canManage = await hasOrganizationPermission(accountId, orgId, Permission.ORG_MEMBERS_MANAGE);
+    if (!canManage) {
         return { code: 403, message: "You don't have permission to remove members from this organization" };
     }
 
@@ -192,6 +187,9 @@ module.exports.removeMember = async (accountId, organizationId, memberAccountId)
 
 
     await OrganizationMember.destroy({ where: { organizationId: orgId, accountId: memberId } });
+    await OrganizationMemberPermission.destroy({ where: { organizationId: orgId, accountId: memberId } });
+
+    revokeLiveSessionAccess(orgId, memberId);
 
     return { success: true, message: "Member removed successfully" };
 };
@@ -210,17 +208,20 @@ module.exports.listMembers = async (accountId, organizationId) => {
     const memberAccountIds = members.map(m => m.accountId);
     const accounts = await Account.findAll({
         where: { id: { [Op.in]: memberAccountIds } },
-        attributes: ["id", "firstName", "lastName", "username"],
+        attributes: ACCOUNT_VIEW_ATTRIBUTES,
     });
 
-    return members.map(member => {
-        const account = accounts.find(a => a.id === member.accountId);
-
-        return {
-            id: member.id, accountId: account.id, name: `${account.firstName} ${account.lastName}`,
-            username: account.username, role: member.role, status: member.status,
-        };
-    });
+    return members
+        .map(member => {
+            const account = accounts.find(a => a.id === member.accountId);
+            if (!account) return null;
+            return {
+                ...toAccountView(account),
+                id: member.id, accountId: account.id, name: `${account.firstName} ${account.lastName}`,
+                role: member.role, status: member.status,
+            };
+        })
+        .filter(Boolean);
 };
 
 module.exports.leaveOrganization = async (accountId, organizationId) => {
@@ -239,5 +240,30 @@ module.exports.leaveOrganization = async (accountId, organizationId) => {
 
     await OrganizationMember.destroy({ where: { organizationId: orgId, accountId } });
 
+    revokeLiveSessionAccess(orgId, accountId);
+
     return { success: true, message: "You have left the organization" };
+};
+
+const getSessionSettings = async (organizationId) => {
+    const organization = await Organization.findByPk(parseInt(organizationId, 10));
+    return { ...Organization.DEFAULT_SESSION_SETTINGS, ...(organization?.sessionSettings || {}) };
+};
+
+module.exports.getSessionSettings = getSessionSettings;
+
+module.exports.updateSessionSettings = async (organizationId, settings) => {
+    const orgId = parseInt(organizationId, 10);
+    const current = await getSessionSettings(orgId);
+    const updated = { ...current, ...settings };
+
+    await Organization.update({ sessionSettings: updated }, { where: { id: orgId } });
+
+    if (current.enableLiveSessionSharing && !updated.enableLiveSessionSharing) {
+        revokeLiveSessionAccess(orgId);
+    } else {
+        stateBroadcaster.broadcast("LIVE_SESSIONS", { organizationId: orgId });
+    }
+
+    return updated;
 };

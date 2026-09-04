@@ -9,9 +9,13 @@ import ScriptDialog from "@/pages/Snippets/components/ScriptDialog";
 import Button from "@/common/components/Button";
 import PageHeader from "@/common/components/PageHeader";
 import SelectBox from "@/common/components/SelectBox";
+import TabSwitcher from "@/common/components/TabSwitcher";
 import { mdiCodeBraces, mdiPlus, mdiScriptText, mdiCloudDownloadOutline, mdiAccount, mdiDomain } from "@mdi/js";
 import { useTranslation } from "react-i18next";
 import { getRequest } from "@/common/utils/RequestUtil.js";
+import { useContext } from "react";
+import { UserContext } from "@/common/contexts/UserContext.jsx";
+import { Permission } from "@/common/utils/permissions.js";
 
 export const Snippets = () => {
     const { t } = useTranslation();
@@ -28,6 +32,8 @@ export const Snippets = () => {
     const [sourceScripts, setSourceScripts] = useState([]);
     const { allSnippets } = useSnippets();
     const { scripts, loadScripts } = useScripts();
+    const { hasPermission } = useContext(UserContext);
+    const canAdd = hasPermission(activeTab === 0 ? Permission.SNIPPETS_MANAGE : Permission.SCRIPTS_MANAGE);
 
     const snippets = useMemo(() => {
         if (selectedSource !== null) {
@@ -184,7 +190,7 @@ export const Snippets = () => {
                 icon={activeTab === 0 ? mdiCodeBraces : mdiScriptText}
                 title={activeTab === 0 ? t("snippets.page.title") : t("scripts.page.title")}
                 subtitle={activeTab === 0 ? t("snippets.page.subtitle") : t("scripts.page.subtitle")}>
-                {!isSourceSelected && (
+                {!isSourceSelected && canAdd && (
                     <Button
                         text={activeTab === 0 ? t("snippets.page.addSnippet") : t("scripts.page.addScript")}
                         icon={mdiPlus}
@@ -196,18 +202,14 @@ export const Snippets = () => {
             <div className="snippets-content-wrapper">
                 <div className="snippets-controls">
                     <div className="snippets-tabs">
-                        <div
-                            className={`tabs-item ${activeTab === 0 ? "tabs-item-active" : ""}`}
-                            onClick={() => setActiveTab(0)}
-                        >
-                            <h3>{t("snippets.page.tabs.snippets")}</h3>
-                        </div>
-                        <div
-                            className={`tabs-item ${activeTab === 1 ? "tabs-item-active" : ""}`}
-                            onClick={() => setActiveTab(1)}
-                        >
-                            <h3>{t("scripts.page.tabs.scripts")}</h3>
-                        </div>
+                        <TabSwitcher
+                            tabs={[
+                                { key: "snippets", label: t("snippets.page.tabs.snippets"), icon: mdiCodeBraces },
+                                { key: "scripts", label: t("scripts.page.tabs.scripts"), icon: mdiScriptText }
+                            ]}
+                            activeTab={activeTab === 0 ? "snippets" : "scripts"}
+                            onTabChange={(tabKey) => setActiveTab(tabKey === "snippets" ? 0 : 1)}
+                        />
                     </div>
 
                     <div className="organization-selector">

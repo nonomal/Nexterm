@@ -1,49 +1,161 @@
-import { useEffect, useRef, useState, useContext } from "react";
+import { useEffect, useRef, useState, useContext, useCallback } from "react";
 import { UserContext } from "@/common/contexts/UserContext.jsx";
+import { IdentityContext } from "@/common/contexts/IdentityContext.jsx";
 import { AIContext } from "@/common/contexts/AIContext.jsx";
-import { useKeymaps, matchesKeybind } from "@/common/contexts/KeymapContext.jsx";
+import { useKeymaps, matchesKeybind, isMac } from "@/common/contexts/KeymapContext.jsx";
 import { Terminal as Xterm } from "@xterm/xterm";
-import { useTheme } from "@/common/contexts/ThemeContext.jsx";
-import { useTerminalSettings } from "@/common/contexts/TerminalSettingsContext.jsx";
+import { usePreferences } from "@/common/contexts/PreferencesContext.jsx";
 import { FitAddon } from "@xterm/addon-fit";
 import { ContextMenu, ContextMenuItem, ContextMenuSeparator, useContextMenu } from "@/common/components/ContextMenu";
-import AICommandPopover from "./components/AICommandPopover";
+import AIAssistant from "./components/AIAssistant";
+import CommandSuggestion from "./components/CommandSuggestion";
 import SnippetsMenu from "./components/SnippetsMenu";
+import PasswordFillHint from "./components/PasswordFillHint";
+import TypingIndicators from "./components/TypingIndicators";
+import { useLiveSessions } from "@/common/contexts/LiveSessionContext.jsx";
 import { createProgressParser } from "../utils/progressParser";
-import { mdiContentCopy, mdiContentPaste, mdiCodeBrackets, mdiSelectAll, mdiDelete, mdiKeyboard } from "@mdi/js";
+import { mdiContentCopy, mdiContentPaste, mdiCodeBrackets, mdiSelectAll, mdiDelete, mdiKeyboard, mdiKey, mdiFolderOpen, mdiRobotHappyOutline, mdiAutoFix } from "@mdi/js";
 import { useTranslation } from "react-i18next";
 import ConnectionLoader from "./components/ConnectionLoader";
+import ConnectionError, { mapConnectionError } from "./components/ConnectionError";
 import { getWebSocketUrl } from "@/common/utils/ConnectionUtil.js";
+import { postRequest } from "@/common/utils/RequestUtil.js";
 import "@xterm/xterm/css/xterm.css";
 import "./styles/xterm.sass";
 
-const XtermRenderer = ({ session, disconnectFromServer, registerTerminalRef, broadcastMode, terminalRefs, updateProgress, layoutMode, onBroadcastToggle, onFullscreenToggle, isShared = false }) => {
+const PASSWORD_PROMPT_REGEX = /^[^$#%>]*(password|passphrase)[^:\r\n]*:\s?$/i;
+const ANSI_ESCAPE_REGEX = /\x1b(?:\[[0-9;?]*[a-zA-Z]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[()][0-9A-B]|[a-zA-Z=><])/g;
+const CONTROL_CHAR_REGEX = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;
+
+const MIN_ZOOM_FONT_SIZE = 6;
+const MAX_ZOOM_FONT_SIZE = 40;
+
+const clampFontSize = (size) => Math.min(MAX_ZOOM_FONT_SIZE, Math.max(MIN_ZOOM_FONT_SIZE, size));
+
+const XtermRenderer = ({ session, disconnectFromServer, markSessionErrored, getSessionError, registerTerminalRef, broadcastMode, terminalRefs, updateProgress, layoutMode, onBroadcastToggle, onFullscreenToggle, isShared = false, onOpenSftp }) => {
     const ref = useRef(null);
     const termRef = useRef(null);
     const wsRef = useRef(null);
     const broadcastModeRef = useRef(broadcastMode);
     const progressParserRef = useRef(null);
-    const terminalBufferRef = useRef([]);
     const layoutModeRef = useRef(layoutMode);
     const onBroadcastToggleRef = useRef(onBroadcastToggle);
     const onFullscreenToggleRef = useRef(onFullscreenToggle);
     const connectionLoaderRef = useRef(null);
-    
+    const smartCopyPasteRef = useRef(false);
+    const zoomOffsetRef = useRef(0);
+
     const userContext = useContext(UserContext);
     const sessionToken = userContext?.sessionToken;
-    const { theme } = useTheme();
-    const { getCurrentTheme, selectedFont, fontSize, cursorStyle, cursorBlink, selectedTheme } = useTerminalSettings();
+    const { theme, getCurrentTheme, selectedFont, fontSize, cursorStyle, cursorBlink, selectedTheme, smartCopyPaste, passwordPromptDetection } = usePreferences();
+
+    const effectiveFont = (isShared && session.fontFamily) ? session.fontFamily : selectedFont;
+    const effectiveFontSize = (isShared && session.fontSize) ? session.fontSize : fontSize;
+    const hintForeground = (theme === "light" && selectedTheme === "light") ? "#000000" : getCurrentTheme().foreground;
+
+    useEffect(() => {
+        zoomOffsetRef.current = 0;
+    }, [effectiveFontSize]);
     const aiContext = useContext(AIContext);
     const isAIAvailable = aiContext?.isAIAvailable || (() => false);
+    const aiAvailableRef = useRef(false);
+    useEffect(() => {
+        aiAvailableRef.current = isAIAvailable();
+    });
     const { getParsedKeybind } = useKeymaps();
     const { t } = useTranslation();
-    const [showAIPopover, setShowAIPopover] = useState(false);
+    const [showAIAssistant, setShowAIAssistant] = useState(false);
+    const [suggestion, setSuggestion] = useState(null);
+    const [suggestionAnchor, setSuggestionAnchor] = useState(null);
+    const suggestionRef = useRef(null);
+    const suggestionSeqRef = useRef(0);
+    const rejectedCommandsRef = useRef([]);
+    const computeAnchorRef = useRef(null);
     const contextMenu = useContextMenu();
+    const { identities } = useContext(IdentityContext);
+    const { getParticipants } = useLiveSessions();
+
+    const typingParticipants = getParticipants(session.joinSessionId || session.id)
+        .filter(participant => participant.typing && participant.accountId !== userContext?.user?.id);
     const [showSnippetsMenu, setShowSnippetsMenu] = useState(false);
+    const [connectionError, setConnectionError] = useState(() => getSessionError?.(session.id) || null);
+    const [passwordPrompt, setPasswordPrompt] = useState(null);
+    const [passwordHintIndex, setPasswordHintIndex] = useState(-1);
+    const [passwordIdentities, setPasswordIdentities] = useState([]);
+    const [cursorAnchor, setCursorAnchor] = useState(null);
+    const passwordPromptRef = useRef(null);
+    const passwordHintIndexRef = useRef(-1);
+    const passwordIdentitiesRef = useRef([]);
+    const passwordDetectionRef = useRef(passwordPromptDetection);
+    const promptLineRef = useRef("");
+
+    const updatePasswordHintIndex = useCallback((index) => {
+        passwordHintIndexRef.current = index;
+        setPasswordHintIndex(index);
+    }, []);
+
+    const cyclePasswordHint = useCallback((offset) => {
+        const count = passwordIdentitiesRef.current.length;
+        if (count < 2) return;
+        updatePasswordHintIndex((passwordHintIndexRef.current + offset + count) % count);
+    }, [updatePasswordHintIndex]);
+
+    const showPasswordHint = useCallback((anchor) => {
+        passwordPromptRef.current = anchor;
+        setPasswordPrompt(anchor);
+        updatePasswordHintIndex(0);
+    }, [updatePasswordHintIndex]);
+
+    const movePasswordHint = useCallback((anchor) => {
+        const current = passwordPromptRef.current;
+        if (!current) return;
+        if (current.left === anchor.left && current.top === anchor.top && current.height === anchor.height) return;
+        passwordPromptRef.current = anchor;
+        setPasswordPrompt(anchor);
+    }, []);
+
+    const hidePasswordHint = useCallback(() => {
+        if (!passwordPromptRef.current) return;
+        passwordPromptRef.current = null;
+        setPasswordPrompt(null);
+        updatePasswordHintIndex(-1);
+    }, [updatePasswordHintIndex]);
+
+    const fillIdentityPassword = useCallback(async (identityId) => {
+        hidePasswordHint();
+        try {
+            await postRequest(`connections/${session.id}/paste-password`, identityId ? { identityId } : undefined);
+        } catch (err) {
+            console.error("Failed to fill identity password:", err);
+        }
+        termRef.current?.focus();
+    }, [hidePasswordHint, session.id]);
+
+    const fillIdentityPasswordRef = useRef(fillIdentityPassword);
+    useEffect(() => {
+        fillIdentityPasswordRef.current = fillIdentityPassword;
+    }, [fillIdentityPassword]);
+
+    const cyclePasswordHintRef = useRef(cyclePasswordHint);
+    useEffect(() => {
+        cyclePasswordHintRef.current = cyclePasswordHint;
+    }, [cyclePasswordHint]);
 
     useEffect(() => {
         broadcastModeRef.current = broadcastMode;
     }, [broadcastMode]);
+
+    useEffect(() => {
+        smartCopyPasteRef.current = smartCopyPaste;
+    }, [smartCopyPaste]);
+
+    useEffect(() => {
+        passwordDetectionRef.current = passwordPromptDetection;
+        if (!passwordPromptDetection) {
+            hidePasswordHint();
+            promptLineRef.current = "";
+        }
+    }, [passwordPromptDetection, hidePasswordHint]);
 
     useEffect(() => {
         layoutModeRef.current = layoutMode;
@@ -58,6 +170,18 @@ const XtermRenderer = ({ session, disconnectFromServer, registerTerminalRef, bro
     }, [onFullscreenToggle]);
 
     useEffect(() => {
+        const serverIdentityIds = session.server?.identities?.length ? [...session.server.identities] : [];
+        if (session.identity != null && !serverIdentityIds.includes(session.identity)) {
+            serverIdentityIds.unshift(session.identity);
+        }
+        passwordIdentitiesRef.current = serverIdentityIds
+            .map(id => identities?.find(i => i.id === id))
+            .filter(i => i && ['password', 'both', 'password-only'].includes(i.type))
+            .map(i => ({ id: i.id, username: i.username }));
+        setPasswordIdentities(passwordIdentitiesRef.current);
+    }, [identities, session.identity, session.server]);
+
+    useEffect(() => {
         if (updateProgress) {
             progressParserRef.current = createProgressParser();
 
@@ -70,18 +194,107 @@ const XtermRenderer = ({ session, disconnectFromServer, registerTerminalRef, bro
         }
     }, [session.id, updateProgress]);
 
-    const toggleAIPopover = () => {
-        if (showAIPopover) {
-            setTimeout(() => termRef.current?.focus(), 0);
-        }
-        setShowAIPopover(!showAIPopover);
+    const toggleAIAssistant = () => setShowAIAssistant((visible) => !visible);
+
+    const handleOpenAIAssistant = () => {
+        contextMenu.close();
+        setShowAIAssistant(true);
     };
 
-    const handleAICommandGenerated = (command) => {
-        if (termRef.current && wsRef.current) {
-            wsRef.current.send(command);
+    const updateSuggestion = useCallback((value) => {
+        suggestionRef.current = value;
+        setSuggestion(value);
+    }, []);
+
+    const hideSuggestion = useCallback(() => {
+        if (!suggestionRef.current) return;
+        suggestionSeqRef.current += 1;
+        rejectedCommandsRef.current = [];
+        updateSuggestion(null);
+    }, [updateSuggestion]);
+
+    const openSuggestionPrompt = useCallback(() => {
+        if (suggestionRef.current) return;
+
+        suggestionSeqRef.current += 1;
+        rejectedCommandsRef.current = [];
+        const anchor = computeAnchorRef.current?.();
+        if (anchor) setSuggestionAnchor(anchor);
+        updateSuggestion({ query: "", commands: [], index: 0, loading: false, error: null });
+    }, [updateSuggestion]);
+
+    const editSuggestionQuery = useCallback((transform) => {
+        const current = suggestionRef.current;
+        if (!current) return;
+
+        suggestionSeqRef.current += 1;
+        rejectedCommandsRef.current = [];
+        updateSuggestion({
+            query: transform(current.query), commands: [], index: 0, loading: false, error: null,
+        });
+    }, [updateSuggestion]);
+
+    const requestSuggestions = useCallback(async (query, rejected) => {
+        const prompt = query.trim();
+        if (!prompt) return;
+
+        const seq = ++suggestionSeqRef.current;
+        updateSuggestion({ query, commands: [], index: 0, loading: true, error: null });
+
+        try {
+            const response = await postRequest("ai/command", {
+                sessionId: session.id,
+                prompt,
+                ...(rejected.length ? { rejected } : {}),
+            });
+            if (seq !== suggestionSeqRef.current) return;
+
+            rejectedCommandsRef.current = [...rejected, ...response.commands].slice(-12);
+            updateSuggestion({ query, commands: response.commands, index: 0, loading: false, error: null });
+        } catch (err) {
+            if (seq !== suggestionSeqRef.current) return;
+            updateSuggestion({
+                query, commands: [], index: 0, loading: false,
+                error: err?.error || err?.message || t("servers.commandSuggestion.error"),
+            });
         }
+    }, [session.id, t, updateSuggestion]);
+
+    const submitSuggestionQuery = useCallback(() => {
+        const current = suggestionRef.current;
+        if (!current || current.loading) return;
+
+        requestSuggestions(current.query, current.commands.length ? rejectedCommandsRef.current : []);
+    }, [requestSuggestions]);
+
+    const acceptSuggestion = useCallback((command) => {
+        hideSuggestion();
+
+        if (wsRef.current?.readyState === WebSocket.OPEN) wsRef.current.send(command);
+        termRef.current?.focus();
+    }, [hideSuggestion]);
+
+    const cycleSuggestion = useCallback((offset) => {
+        const current = suggestionRef.current;
+        if (!current || current.commands.length < 2) return;
+
+        const count = current.commands.length;
+        updateSuggestion({ ...current, index: (current.index + offset + count) % count });
+    }, [updateSuggestion]);
+
+    const handleGenerateCommand = () => {
+        contextMenu.close();
+        termRef.current?.focus();
+        openSuggestionPrompt();
     };
+
+    const suggestionActionsRef = useRef({});
+    useEffect(() => {
+        suggestionActionsRef.current = {
+            openSuggestionPrompt, editSuggestionQuery, submitSuggestionQuery,
+            acceptSuggestion, cycleSuggestion, hideSuggestion,
+        };
+    }, [openSuggestionPrompt, editSuggestionQuery, submitSuggestionQuery, acceptSuggestion, cycleSuggestion, hideSuggestion]);
 
     const handleContextMenu = (e) => {
         e.preventDefault();
@@ -89,34 +302,51 @@ const XtermRenderer = ({ session, disconnectFromServer, registerTerminalRef, bro
         contextMenu.open(e, { x: e.clientX, y: e.clientY });
     };
 
+    const copyToClipboard = (text) => {
+        navigator.clipboard.writeText(text).catch(() => {
+            const textArea = document.createElement('textarea');
+            textArea.value = text;
+            textArea.style.cssText = 'position:fixed;left:-9999px;top:-9999px';
+            document.body.appendChild(textArea);
+            textArea.select();
+            document.execCommand('copy');
+            document.body.removeChild(textArea);
+        });
+    };
+
     const handleCopy = () => {
         const selection = termRef.current?.getSelection();
-        if (selection) {
-            navigator.clipboard.writeText(selection).catch(() => {});
-        }
+        if (selection) copyToClipboard(selection);
         contextMenu.close();
+        termRef.current?.focus();
     };
 
     const handlePaste = async () => {
         try {
             const text = await navigator.clipboard.readText();
-            if (text && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-                wsRef.current.send(text);
-            }
+            if (text) termRef.current?.paste(text);
         } catch (err) {
             console.error('Failed to paste:', err);
         }
         contextMenu.close();
+        termRef.current?.focus();
+    };
+
+    const handlePasteIdentity = async () => {
+        contextMenu.close();
+        await fillIdentityPassword(null);
     };
 
     const handleSelectAll = () => {
         termRef.current?.selectAll();
         contextMenu.close();
+        termRef.current?.focus();
     };
 
     const handleClearTerminal = () => {
         termRef.current?.clear();
         contextMenu.close();
+        termRef.current?.focus();
     };
 
     const handleInsertSnippet = () => {
@@ -137,12 +367,15 @@ const XtermRenderer = ({ session, disconnectFromServer, registerTerminalRef, bro
             wsRef.current.send('\x03');
         }
         contextMenu.close();
+        termRef.current?.focus();
     };
 
     useEffect(() => {
         if (!sessionToken && !isShared) return;
+        if (getSessionError?.(session.id)) return;
 
         let isCleaningUp = false;
+        setConnectionError(null);
 
         const terminalTheme = getCurrentTheme();
         const isLightTerminalTheme = selectedTheme === "light";
@@ -150,8 +383,8 @@ const XtermRenderer = ({ session, disconnectFromServer, registerTerminalRef, bro
         const term = new Xterm({
             cursorBlink: cursorBlink,
             cursorStyle: cursorStyle,
-            fontSize: fontSize,
-            fontFamily: selectedFont,
+            fontSize: clampFontSize(effectiveFontSize + zoomOffsetRef.current),
+            fontFamily: effectiveFont,
             theme: {
                 background: (theme === "light" && isLightTerminalTheme) ? "#F3F3F3" : terminalTheme.background,
                 foreground: (theme === "light" && isLightTerminalTheme) ? "#000000" : terminalTheme.foreground,
@@ -181,20 +414,83 @@ const XtermRenderer = ({ session, disconnectFromServer, registerTerminalRef, bro
         term.loadAddon(fitAddon);
         term.open(ref.current);
 
+        const computePasswordHintPosition = () => {
+            const cell = term._core?._renderService?.dimensions?.css?.cell;
+            const cellWidth = cell?.width || (ref.current?.clientWidth || 0) / (term.cols || 1);
+            const cellHeight = cell?.height || (ref.current?.clientHeight || 0) / (term.rows || 1);
+
+            return {
+                left: term.buffer.active.cursorX * cellWidth,
+                top: term.buffer.active.cursorY * cellHeight,
+                width: cellWidth,
+                height: cellHeight,
+                spaceBelow: (term.rows - term.buffer.active.cursorY - 1) * cellHeight,
+            };
+        };
+
+        computeAnchorRef.current = computePasswordHintPosition;
+
+        const syncCursorAnchor = () => {
+            const anchor = computePasswordHintPosition();
+            setCursorAnchor(current => (current && current.left === anchor.left && current.top === anchor.top
+                && current.width === anchor.width && current.height === anchor.height
+                && current.spaceBelow === anchor.spaceBelow) ? current : anchor);
+            if (suggestionRef.current) setSuggestionAnchor(anchor);
+        };
+
         const handleResize = () => {
             fitAddon.fit();
             if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
                 wsRef.current.send(`\x01${term.cols},${term.rows}`);
             }
+            if (passwordPromptRef.current) movePasswordHint(computePasswordHintPosition());
+            if (suggestionRef.current) setSuggestionAnchor(computePasswordHintPosition());
+            syncCursorAnchor();
         };
 
         window.addEventListener("resize", handleResize);
+        const resizeObserver = new ResizeObserver(() => {
+            if (ws.readyState === ws.OPEN) handleResize();
+        });
+        resizeObserver.observe(ref.current);
+
+        const applyFontSize = (size) => {
+            const next = clampFontSize(size);
+            if (next === term.options.fontSize) return;
+            term.options.fontSize = next;
+            zoomOffsetRef.current = next - effectiveFontSize;
+            handleResize();
+        };
+
+        const zoomBy = (delta) => applyFontSize(term.options.fontSize + delta);
+        const resetZoom = () => applyFontSize(effectiveFontSize);
+
+        const handleWheelZoom = (event) => {
+            if (!event.ctrlKey && !event.metaKey) return;
+            event.preventDefault();
+            event.stopPropagation();
+            if (event.deltaY === 0) return;
+            zoomBy(event.deltaY < 0 ? 1 : -1);
+        };
+
+        ref.current?.addEventListener("wheel", handleWheelZoom, { passive: false, capture: true });
+
+        const handleNativePaste = (e) => {
+            const text = e.clipboardData?.getData('text');
+            if (text) {
+                e.preventDefault();
+                term.paste(text);
+            }
+        };
+        ref.current?.addEventListener('paste', handleNativePaste);
 
         let ws;
 
-        const wsParams = isShared 
-            ? { shareId: session.shareId || session.id.split('/').pop() }
-            : { sessionToken, sessionId: session.id };
+        const wsParams = session.joinSessionId
+            ? { sessionToken, joinSessionId: session.joinSessionId }
+            : isShared
+                ? { shareId: session.shareId || session.id.split('/').pop() }
+                : { sessionToken, sessionId: session.id };
 
         const wsUrl = getWebSocketUrl("/api/ws/term", wsParams);
 
@@ -213,17 +509,43 @@ const XtermRenderer = ({ session, disconnectFromServer, registerTerminalRef, bro
             ws.send(`\x01${term.cols},${term.rows}`);
         }
 
-        ws.onclose = () => {
+        const reportError = (message) => {
+            markSessionErrored?.(session.id, message);
+            setConnectionError(message);
+        };
+
+        const cursorSyncDisposable = term.onCursorMove(syncCursorAnchor);
+
+        const trackPasswordPrompt = (data) => {
+            if (isShared || !passwordDetectionRef.current || passwordIdentitiesRef.current.length === 0) return;
+
+            const cleaned = data.replace(ANSI_ESCAPE_REGEX, "").replace(CONTROL_CHAR_REGEX, "");
+            promptLineRef.current = (promptLineRef.current + cleaned).split(/[\r\n]/).pop().slice(-256);
+
+            if (PASSWORD_PROMPT_REGEX.test(promptLineRef.current)) {
+                if (!passwordPromptRef.current) showPasswordHint(computePasswordHintPosition());
+            } else {
+                hidePasswordHint();
+            }
+        };
+
+        ws.onclose = (event) => {
             clearInterval(interval);
-            if (!isCleaningUp) {
+            if (isCleaningUp) return;
+
+            if (event.code >= 4000 && event.reason) {
+                reportError(mapConnectionError(event.reason, t));
+            } else if (event.code !== 1000 && event.code !== 1005) {
+                reportError(t("common.errors.connection.closedUnexpectedly"));
+            } else {
                 disconnectFromServer(session.id);
             }
         };
 
         ws.onerror = (error) => {
-            console.error('WebSocket error:', error);
+            console.error("WebSocket error:", error);
             if (!isCleaningUp) {
-                disconnectFromServer(session.id);
+                reportError(t("common.errors.connection.error"));
             }
         };
 
@@ -252,9 +574,7 @@ const XtermRenderer = ({ session, disconnectFromServer, registerTerminalRef, bro
                     }
                 });
             } else {
-                term.write(data);
-                terminalBufferRef.current.push(data);
-                if (terminalBufferRef.current.length > 50) terminalBufferRef.current.shift();
+                term.write(data, () => trackPasswordPrompt(data));
 
                 if (progressParserRef.current && updateProgress) {
                     const progress = progressParserRef.current.parseData(data);
@@ -270,7 +590,13 @@ const XtermRenderer = ({ session, disconnectFromServer, registerTerminalRef, bro
             }
         };
 
+        term.onScroll(() => {
+            hidePasswordHint();
+            suggestionActionsRef.current.hideSuggestion?.();
+        });
+
         term.onData((data) => {
+            if (passwordPromptRef.current) hidePasswordHint();
             ws.send(data);
 
             if (broadcastModeRef.current && terminalRefs?.current) {
@@ -284,22 +610,110 @@ const XtermRenderer = ({ session, disconnectFromServer, registerTerminalRef, bro
 
         term.attachCustomKeyEventHandler((event) => {
             if (event.type === "keydown") {
+                if ((event.ctrlKey || event.metaKey) && !event.altKey) {
+                    const zoomInKey = event.key === "+" || event.key === "=" || event.code === "NumpadAdd";
+                    const zoomOutKey = event.key === "-" || event.code === "NumpadSubtract";
+                    const zoomResetKey = event.key === "0" || event.code === "Numpad0";
+
+                    if (zoomInKey || zoomOutKey || zoomResetKey) {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        if (zoomResetKey) resetZoom(); else zoomBy(zoomInKey ? 1 : -1);
+                        return false;
+                    }
+                }
+
+                if (passwordPromptRef.current) {
+                    const hintItems = passwordIdentitiesRef.current;
+                    const hintIndex = passwordHintIndexRef.current;
+
+                    if (event.key === "Tab") {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        fillIdentityPasswordRef.current(hintItems[hintIndex]?.id);
+                        return false;
+                    }
+                    if (event.key === "Escape") {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        hidePasswordHint();
+                        return false;
+                    }
+                    if (hintItems.length > 1 && (event.key === "ArrowUp" || event.key === "ArrowDown")) {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        cyclePasswordHintRef.current(event.key === "ArrowUp" ? -1 : 1);
+                        return false;
+                    }
+                }
+
+                const activeSuggestion = suggestionRef.current;
+                if (activeSuggestion) {
+                    const actions = suggestionActionsRef.current;
+                    const commands = activeSuggestion.commands;
+
+                    event.preventDefault();
+                    event.stopPropagation();
+
+                    const retryKeybind = getParsedKeybind("ai-command");
+                    if (retryKeybind && matchesKeybind(event, retryKeybind)) {
+                        actions.submitSuggestionQuery?.();
+                        return false;
+                    }
+
+                    if (event.key === "Escape") {
+                        actions.hideSuggestion?.();
+                    } else if (event.key === "Tab") {
+                        if (commands.length) actions.acceptSuggestion?.(commands[activeSuggestion.index]);
+                    } else if (event.key === "Enter") {
+                        actions.submitSuggestionQuery?.();
+                    } else if (event.key === "ArrowUp" || event.key === "ArrowDown") {
+                        if (commands.length > 1) actions.cycleSuggestion?.(event.key === "ArrowUp" ? -1 : 1);
+                    } else if (event.key === "Backspace") {
+                        actions.editSuggestionQuery?.((query) => query.slice(0, -1));
+                    } else if (event.key.length === 1 && !event.ctrlKey && !event.metaKey && !event.altKey) {
+                        actions.editSuggestionQuery?.((query) => query + event.key);
+                    }
+
+                    return false;
+                }
+
                 const copyKeybind = getParsedKeybind("copy");
                 if (copyKeybind && matchesKeybind(event, copyKeybind)) {
                     const selection = term.getSelection();
                     if (selection) {
                         event.preventDefault();
                         event.stopPropagation();
-                        navigator.clipboard.writeText(selection).catch(() => { });
+                        copyToClipboard(selection);
+                        return false;
+                    }
+                }
+
+                if (smartCopyPasteRef.current && !isMac() && event.key.toLowerCase() === "c"
+                    && event.ctrlKey && !event.shiftKey && !event.altKey && !event.metaKey) {
+                    const selection = term.getSelection();
+                    if (selection) {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        copyToClipboard(selection);
+                        term.clearSelection();
                         return false;
                     }
                 }
 
                 const aiKeybind = getParsedKeybind("ai-menu");
-                if (aiKeybind && isAIAvailable() && matchesKeybind(event, aiKeybind)) {
+                if (aiKeybind && aiAvailableRef.current && matchesKeybind(event, aiKeybind)) {
                     event.preventDefault();
                     event.stopPropagation();
-                    toggleAIPopover();
+                    toggleAIAssistant();
+                    return false;
+                }
+
+                const aiCommandKeybind = getParsedKeybind("ai-command");
+                if (aiCommandKeybind && aiAvailableRef.current && matchesKeybind(event, aiCommandKeybind)) {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    suggestionActionsRef.current.openSuggestionPrompt?.();
                     return false;
                 }
 
@@ -308,6 +722,14 @@ const XtermRenderer = ({ session, disconnectFromServer, registerTerminalRef, bro
                     event.preventDefault();
                     event.stopPropagation();
                     window.dispatchEvent(new CustomEvent('terminal-snippets-shortcut'));
+                    return false;
+                }
+
+                const pasteIdentityKeybind = getParsedKeybind("paste-identity-password");
+                if (pasteIdentityKeybind && passwordIdentitiesRef.current.length > 0 && matchesKeybind(event, pasteIdentityKeybind)) {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    fillIdentityPasswordRef.current(null);
                     return false;
                 }
 
@@ -347,36 +769,66 @@ const XtermRenderer = ({ session, disconnectFromServer, registerTerminalRef, bro
 
         return () => {
             isCleaningUp = true;
+            passwordPromptRef.current = null;
+            passwordHintIndexRef.current = -1;
+            promptLineRef.current = "";
             if (registerTerminalRef) {
                 registerTerminalRef(session.id, null);
             }
             window.removeEventListener("resize", handleResize);
+            resizeObserver.disconnect();
+            ref.current?.removeEventListener('paste', handleNativePaste);
+            ref.current?.removeEventListener("wheel", handleWheelZoom, { capture: true });
             if (ws) {
                 ws.onclose = null;
                 ws.onerror = null;
                 ws.close();
             }
+            cursorSyncDisposable.dispose();
             term.dispose();
             clearInterval(interval);
             termRef.current = null;
             wsRef.current = null;
         };
-    }, [sessionToken, selectedFont, fontSize, cursorStyle, cursorBlink, selectedTheme, isShared]);
+    }, [sessionToken, effectiveFont, effectiveFontSize, cursorStyle, cursorBlink, selectedTheme, isShared]);
 
     return (
         <div className="xterm-container" onContextMenu={!isShared ? handleContextMenu : undefined}>
             <ConnectionLoader onReady={(loader) => { connectionLoaderRef.current = loader; }} />
+            {connectionError && (
+                <ConnectionError message={connectionError} onClose={() => disconnectFromServer(session.id)} />
+            )}
             <div ref={ref} className="xterm-wrapper" />
-            {!isShared && isAIAvailable() && (
-                <AICommandPopover visible={showAIPopover} onClose={() => setShowAIPopover(false)}
-                    onCommandGenerated={handleAICommandGenerated} focusTerminal={() => termRef.current?.focus()}
-                    entryId={session.server?.id}
-                    recentOutput={terminalBufferRef.current.join('')
-                        .replace(/\x1B\[[0-9;]*[a-zA-Z]/g, '')
-                        .replace(/[\x00-\x1F\x7F]/g, ' ')
-                        .replace(/\s+/g, ' ')
-                        .trim()
-                        .slice(-1500)} />
+            <TypingIndicators anchor={cursorAnchor} participants={typingParticipants} />
+            {!isShared && passwordPrompt && passwordIdentities.length > 0 && (
+                <PasswordFillHint
+                    anchor={passwordPrompt}
+                    items={passwordIdentities}
+                    selectedIndex={passwordHintIndex}
+                    onFill={fillIdentityPassword}
+                    onCycle={cyclePasswordHint}
+                    foreground={hintForeground}
+                    fontFamily={effectiveFont}
+                    fontSize={effectiveFontSize}
+                />
+            )}
+            {!isShared && isAIAvailable() && showAIAssistant && (
+                <AIAssistant session={session} onClose={() => setShowAIAssistant(false)} />
+            )}
+            {!isShared && isAIAvailable() && suggestion && suggestionAnchor && (
+                <CommandSuggestion
+                    anchor={suggestionAnchor}
+                    commands={suggestion.commands}
+                    selectedIndex={suggestion.index}
+                    query={suggestion.query}
+                    loading={suggestion.loading}
+                    error={suggestion.error}
+                    onAccept={acceptSuggestion}
+                    onCycle={cycleSuggestion}
+                    foreground={hintForeground}
+                    fontFamily={effectiveFont}
+                    fontSize={effectiveFontSize}
+                />
             )}
             {!isShared && (
                 <ContextMenu
@@ -407,6 +859,27 @@ const XtermRenderer = ({ session, disconnectFromServer, registerTerminalRef, bro
                         label={t('servers.fileManager.contextMenu.insertSnippet')}
                         onClick={handleInsertSnippet}
                     />
+                    {isAIAvailable() && (
+                        <ContextMenuItem
+                            icon={mdiAutoFix}
+                            label={t('servers.commandSuggestion.open')}
+                            onClick={handleGenerateCommand}
+                        />
+                    )}
+                    {isAIAvailable() && (
+                        <ContextMenuItem
+                            icon={mdiRobotHappyOutline}
+                            label={t('servers.aiAssistant.open')}
+                            onClick={handleOpenAIAssistant}
+                        />
+                    )}
+                    {passwordIdentities.length > 0 && (
+                        <ContextMenuItem
+                            icon={mdiKey}
+                            label={t('servers.contextMenu.pasteIdentityPassword')}
+                            onClick={handlePasteIdentity}
+                        />
+                    )}
                     <ContextMenuSeparator />
                     <ContextMenuItem
                         icon={mdiKeyboard}
@@ -418,6 +891,16 @@ const XtermRenderer = ({ session, disconnectFromServer, registerTerminalRef, bro
                         label={t('servers.fileManager.contextMenu.clearTerminal')}
                         onClick={handleClearTerminal}
                     />
+                    {onOpenSftp && (
+                        <>
+                            <ContextMenuSeparator />
+                            <ContextMenuItem
+                                icon={mdiFolderOpen}
+                                label={t('servers.tabs.contextMenu.openSftp')}
+                                onClick={() => { contextMenu.close(); onOpenSftp(); }}
+                            />
+                        </>
+                    )}
                 </ContextMenu>
             )}
             {!isShared && (

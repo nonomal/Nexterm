@@ -1,4 +1,5 @@
 @use "@/common/styles/colors"
+@use "@/common/styles/breakpoints"
 
 .view-container
   display: flex
@@ -9,83 +10,59 @@
   overflow: hidden
   transition: all 0.3s ease
 
+  @media (max-width: breakpoints.$mobile)
+    min-height: 0
+
   &.fullscreen
     position: fixed
-    top: 0
-    left: 0
-    width: 100vw
-    height: 100vh
+    inset: var(--title-bar-height) 0 0 0
     z-index: 1000
 
-.exit-fullscreen-btn
-  position: fixed
-  top: 1rem
-  right: 1rem
-  z-index: 1001
-  background-color: rgba(0, 0, 0, 0.7)
-  border: 1px solid colors.$darker-gray
-  border-radius: 8px
-  padding: 0.5rem
-  cursor: pointer
-  display: flex
-  align-items: center
-  justify-content: center
-  transition: all 0.2s ease
-  backdrop-filter: blur(10px)
-
-  svg
-    width: 1.5rem
-    height: 1.5rem
-    color: colors.$white
-
-  &:hover
-    background-color: rgba(0, 0, 0, 0.9)
-    border-color: colors.$primary
-    transform: scale(1.05)
-
-    svg
-      color: colors.$primary
-
-  &:active
-    transform: scale(0.95)
+    body.session-fullscreen &
+      inset: 0
 
 .view-layouter
   position: relative
-  height: calc(100% - 3.5rem)
+  flex: 1
+  min-height: 0
   width: 100%
   overflow: hidden
 
-  .view-container.fullscreen &
-    height: 100vh
-
-  &.single
-    .session-renderer
-      &.visible
-        opacity: 1
-        pointer-events: auto
-
-      &.hidden
-        opacity: 0
-        pointer-events: none
-
-  &:not(.single)
-    display: flex
-    flex-direction: column
-    gap: 0
+.view-layouter
+  &.split
     background-color: colors.$darker-gray
+
+    @media (max-width: breakpoints.$mobile)
+      .session-renderer
+        top: 0 !important
+        left: 0 !important
+        width: 100% !important
+        height: 100% !important
+
+        &:not(.active)
+          opacity: 0
+          pointer-events: none
 
   &.resizing
     .session-renderer
       pointer-events: none
 
-.grid-row
-  display: flex
-  gap: 0
-  overflow: hidden
+    *
+      user-select: none !important
+
+    &.resizing-horizontal, &.resizing-horizontal *
+      cursor: col-resize !important
+
+    &.resizing-vertical, &.resizing-vertical *
+      cursor: row-resize !important
 
 .session-renderer
   background-color: colors.$terminal
   overflow: hidden
+  -webkit-overflow-scrolling: touch
+
+  .xterm-screen
+    padding-left: 3px
 
   &.visible
     opacity: 1
@@ -95,39 +72,36 @@
     opacity: 0
     pointer-events: none
 
-.grid-resizer
-  background: transparent
-  transition: background-color 0.2s ease
+.layout-sash
+  position: absolute
+  z-index: 10
+  background-color: colors.$gray
+  opacity: 0.1
   user-select: none
-  flex-shrink: 0
+  touch-action: none
+  transition: opacity 0.15s ease, background-color 0.15s ease
 
-  &:hover
-    background-color: colors.$primary !important
+  &::before
+    content: ""
+    position: absolute
+    inset: -4px
 
-  &:active, .view-layouter.resizing &
-    background-color: colors.$primary !important
+  @media (max-width: breakpoints.$tablet)
+    &::before
+      inset: -6px
 
-  &.vertical
+  @media (max-width: breakpoints.$mobile)
+    display: none
+
+  &.columns
     cursor: col-resize
 
-  &.horizontal
+  &.rows
     cursor: row-resize
 
-.view-layouter.resizing
-  *
-    user-select: none !important
+  &:hover
+    opacity: 0.6
 
-  .grid-resizer
-    pointer-events: auto !important
-
-  &.resizing-vertical
-    cursor: col-resize !important
-
-    *
-      cursor: col-resize !important
-
-  &.resizing-horizontal
-    cursor: row-resize !important
-
-    *
-      cursor: row-resize !important
+  .view-layouter.resizing &
+    opacity: 1
+    background-color: colors.$primary

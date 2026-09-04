@@ -1,16 +1,58 @@
 use tauri::{WebviewUrl, WebviewWindowBuilder, Emitter};
+use tauri_plugin_opener::OpenerExt;
 use std::sync::Arc;
 
 mod tunnel;
 use tunnel::{TunnelConfig, TunnelManager, TunnelStatus};
 
+mod host_fs;
+use host_fs::HostFsState;
+
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[tauri::command]
-async fn open_popout(app: tauri::AppHandle, session_id: String) -> Result<(), String> {
-    let window_label = format!("popout_{}", session_id);
-    let url = format!("/popout/{}", session_id);
-    let session_id_clone = session_id.clone();
-    let app_clone = app.clone();
+fn get_user_agent() -> String {
+    let arch = std::env::consts::ARCH;
+    let os_version = os_info::get();
     
+    format!(
+        "NextermConnector/{} ({} {}; {})",
+        APP_VERSION,
+        os_version.os_type(),
+        os_version.version(),
+        arch
+    )
+}
+
+#[tauri::command]
+async fn open_external_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
+    app.opener()
+        .open_url(&url, None::<&str>)
+        .map_err(|e| e.to_string())
+}
+
+#[derive(Clone, serde::Serialize)]
+struct PopoutClosed {
+    #[serde(rename = "sessionId")]
+    session_id: String,
+    monitor: Option<u32>,
+}
+
+#[tauri::command]
+async fn open_popout(app: tauri::AppHandle, session_id: String, monitor: Option<u32>)
+        -> Result<(), String> {
+
+    let (window_label, url) = match monitor {
+        Some(monitor) => (
+            format!("popout_{}_m{}", session_id, monitor),
+            format!("/popout/{}/{}", session_id, monitor),
+        ),
+        None => (format!("popout_{}", session_id), format!("/popout/{}", session_id)),
+    };
+
+    let closed = PopoutClosed { session_id, monitor };
+    let app_clone = app.clone();
+
     let window = WebviewWindowBuilder::new(&app, &window_label, WebviewUrl::App(url.into()))
         .title("Nexterm - Session")
         .inner_size(1024.0, 768.0)
@@ -18,13 +60,13 @@ async fn open_popout(app: tauri::AppHandle, session_id: String) -> Result<(), St
         .decorations(false)
         .build()
         .map_err(|e| e.to_string())?;
-    
+
     window.on_window_event(move |event| {
         if let tauri::WindowEvent::Destroyed = event {
-            let _ = app_clone.emit_to("main", "popout_closed", &session_id_clone);
+            let _ = app_clone.emit_to("main", "popout_closed", closed.clone());
         }
     });
-    
+
     Ok(())
 }
 
@@ -88,17 +130,34 @@ pub mod urlencoding {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let tunnel_manager = Arc::new(TunnelManager::new());
-    
+    let host_fs = HostFsState::default();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_http::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_opener::init())
         .manage(tunnel_manager)
+        .manage(host_fs)
         .invoke_handler(tauri::generate_handler![
             open_popout,
             open_tunnel_window,
+            open_external_url,
             start_tunnel,
             stop_tunnel,
             list_tunnels,
-            get_tunnel_status
+            get_tunnel_status,
+            get_user_agent,
+            host_fs::host_fs_open,
+            host_fs::host_fs_read,
+            host_fs::host_fs_write,
+            host_fs::host_fs_close,
+            host_fs::host_fs_readdir,
+            host_fs::host_fs_stat,
+            host_fs::host_fs_unlink,
+            host_fs::host_fs_rename,
+            host_fs::host_fs_truncate
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

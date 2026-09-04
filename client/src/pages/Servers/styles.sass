@@ -1,4 +1,12 @@
 @use "@/common/styles/colors"
+@use "@/common/styles/breakpoints"
+
+body.sidebar-resizing
+  user-select: none
+  cursor: col-resize
+
+  .view-container
+    pointer-events: none
 
 .server-page
   display: flex
@@ -6,6 +14,12 @@
   height: 100%
   position: relative
 
+  @media (max-width: breakpoints.$mobile)
+    flex-direction: column
+
   &:has(.view-container.fullscreen)
     .server-list
+      display: none
+
+    .server-list-overlay
       display: none

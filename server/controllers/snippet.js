@@ -1,41 +1,64 @@
 const Snippet = require("../models/Snippet");
 const { Op } = require("sequelize");
+const stateBroadcaster = require("../lib/StateBroadcaster");
+const { hasResourcePermission } = require("../utils/permission");
+const { Permission } = require("../permissions/registry");
 
-const getWhereClause = (id, accountId, organizationId) => organizationId 
-    ? { id, organizationId } 
+const getWhereClause = (id, accountId, organizationId) => organizationId
+    ? { id, organizationId }
     : { id, accountId, organizationId: null };
 
+const canManage = (accountId, organizationId) =>
+    hasResourcePermission(accountId, organizationId, Permission.SNIPPETS_MANAGE);
+
 module.exports.createSnippet = async (accountId, configuration) => {
+    if (!(await canManage(accountId, configuration.organizationId)))
+        return { code: 403, message: "You don't have permission to manage snippets" };
+
     const maxSortOrder = await Snippet.max('sortOrder', {
         where: configuration.organizationId 
             ? { organizationId: configuration.organizationId }
             : { accountId, organizationId: null, sourceId: null }
     }) || 0;
-    return Snippet.create({ 
+    const snippet = await Snippet.create({ 
         ...configuration, 
         accountId: configuration.organizationId ? null : accountId,
         sortOrder: maxSortOrder + 1 
     });
+
+    stateBroadcaster.broadcast("SNIPPETS", { accountId, organizationId: configuration.organizationId });
+
+    return snippet;
 };
 
 module.exports.deleteSnippet = async (accountId, snippetId, organizationId = null) => {
+    if (!(await canManage(accountId, organizationId)))
+        return { code: 403, message: "You don't have permission to manage snippets" };
     const snippet = await Snippet.findOne({ where: getWhereClause(snippetId, accountId, organizationId) });
     if (!snippet) return { code: 404, message: "Snippet does not exist" };
     if (snippet.sourceId) return { code: 403, message: "Cannot delete source-synced snippets" };
     await Snippet.destroy({ where: { id: snippetId } });
+
+    stateBroadcaster.broadcast("SNIPPETS", { accountId, organizationId: snippet.organizationId });
 };
 
 module.exports.editSnippet = async (accountId, snippetId, configuration, organizationId = null) => {
+    if (!(await canManage(accountId, organizationId)))
+        return { code: 403, message: "You don't have permission to manage snippets" };
     const snippet = await Snippet.findOne({ where: getWhereClause(snippetId, accountId, organizationId) });
     if (!snippet) return { code: 404, message: "Snippet does not exist" };
     if (snippet.sourceId) return { code: 403, message: "Cannot edit source-synced snippets" };
     const { organizationId: _, accountId: __, ...updateData } = configuration;
     await Snippet.update(updateData, { where: { id: snippetId } });
+
+    stateBroadcaster.broadcast("SNIPPETS", { accountId, organizationId: snippet.organizationId });
 };
 
 module.exports.repositionSnippet = async (accountId, snippetId, { targetId }, organizationId = null) => {
     if (!targetId || parseInt(snippetId) === parseInt(targetId)) return { success: true };
-    
+    if (!(await canManage(accountId, organizationId)))
+        return { code: 403, message: "You don't have permission to manage snippets" };
+
     const snippet = await Snippet.findOne({ where: getWhereClause(snippetId, accountId, organizationId) });
     if (!snippet) return { code: 404, message: "Snippet does not exist" };
     if (snippet.sourceId) return { code: 403, message: "Cannot reorder source-synced snippets" };
@@ -49,6 +72,9 @@ module.exports.repositionSnippet = async (accountId, snippetId, { targetId }, or
     
     all.splice(tgtIdx, 0, all.splice(srcIdx, 1)[0]);
     await Promise.all(all.map((s, i) => Snippet.update({ sortOrder: i + 1 }, { where: { id: s.id } })));
+
+    stateBroadcaster.broadcast("SNIPPETS", { accountId, organizationId: snippet.organizationId });
+
     return { success: true };
 };
 

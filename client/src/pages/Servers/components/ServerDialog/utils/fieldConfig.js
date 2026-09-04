@@ -1,3 +1,5 @@
+import { mdiInformationOutline, mdiAccountKeyOutline, mdiCogOutline } from "@mdi/js";
+
 export const getFieldConfig = (type, protocol) => {
     if (type === "server") {
         switch (protocol) {
@@ -9,7 +11,9 @@ export const getFieldConfig = (type, protocol) => {
                     showSettings: true,
                     showMonitoring: true,
                     showKeyboardLayout: false,
+                    showTerminalSettings: true,
                     allowedAuthTypes: ["password", "ssh", "both"],
+                    showWakeOnLan: true,
                 };
             case "telnet":
                 return {
@@ -19,6 +23,8 @@ export const getFieldConfig = (type, protocol) => {
                     showSettings: true,
                     showMonitoring: false,
                     showKeyboardLayout: false,
+                    showTerminalSettings: true,
+                    showWakeOnLan: true,
                 };
             case "rdp":
                 return {
@@ -31,7 +37,9 @@ export const getFieldConfig = (type, protocol) => {
                     showDisplaySettings: true,
                     showPerformanceSettings: true,
                     showAudioSettings: true,
+                    showRdpSecurity: true,
                     allowedAuthTypes: ["password-only", "password"],
+                    showWakeOnLan: true,
                 };
             case "vnc":
                 return {
@@ -44,6 +52,41 @@ export const getFieldConfig = (type, protocol) => {
                     showDisplaySettings: true,
                     showAudioSettings: true,
                     allowedAuthTypes: ["password-only", "password"],
+                    showWakeOnLan: true,
+                };
+            case "demo":
+                return {
+                    showProtocol: false,
+                    showIpPort: false,
+                    showIdentities: false,
+                    showSettings: false,
+                    showMonitoring: false,
+                    showKeyboardLayout: false,
+                };
+            case "sftp":
+                return {
+                    showProtocol: false,
+                    showIpPort: true,
+                    showIdentities: true,
+                    showSettings: true,
+                    showMonitoring: false,
+                    showKeyboardLayout: false,
+                    showTerminalSettings: false,
+                    allowedAuthTypes: ["password", "ssh", "both"],
+                    showWakeOnLan: true,
+                };
+            case "ftp":
+            case "ftps":
+                return {
+                    showProtocol: false,
+                    showIpPort: true,
+                    showIdentities: true,
+                    showSettings: true,
+                    showMonitoring: false,
+                    showKeyboardLayout: false,
+                    showTerminalSettings: false,
+                    allowedAuthTypes: ["password"],
+                    showWakeOnLan: true,
                 };
             default:
                 return {
@@ -54,11 +97,12 @@ export const getFieldConfig = (type, protocol) => {
                     showMonitoring: true,
                     showKeyboardLayout: true,
                     allowedAuthTypes: ["password", "ssh", "both"],
+                    showWakeOnLan: true,
                 };
         }
     }
 
-    if (type === "pve-shell") {
+    if (type === "pve-shell" || type === "pve-lxc") {
         return {
             showProtocol: false,
             showIpPort: false,
@@ -66,21 +110,6 @@ export const getFieldConfig = (type, protocol) => {
             showSettings: false,
             showMonitoring: false,
             showKeyboardLayout: false,
-            showPveConfig: true,
-            pveFields: ["nodeName"],
-        };
-    }
-
-    if (type === "pve-lxc") {
-        return {
-            showProtocol: false,
-            showIpPort: false,
-            showIdentities: false,
-            showSettings: false,
-            showMonitoring: false,
-            showKeyboardLayout: false,
-            showPveConfig: true,
-            pveFields: ["nodeName", "vmid"],
         };
     }
 
@@ -94,8 +123,6 @@ export const getFieldConfig = (type, protocol) => {
             showKeyboardLayout: false,
             showDisplaySettings: true,
             showAudioSettings: true,
-            showPveConfig: true,
-            pveFields: ["nodeName", "vmid"],
         };
     }
 
@@ -113,14 +140,14 @@ export const getAvailableTabs = (type, protocol) => {
     const config = getFieldConfig(type, protocol);
     const tabs = [];
 
-    tabs.push({ key: "details", label: "servers.dialog.tabs.details" });
+    tabs.push({ key: "details", label: "servers.dialog.tabs.details", icon: mdiInformationOutline });
 
     if (config.showIdentities) {
-        tabs.push({ key: "identities", label: "servers.dialog.tabs.identities" });
+        tabs.push({ key: "identities", label: "servers.dialog.tabs.identities", icon: mdiAccountKeyOutline });
     }
 
-    if (config.showSettings && (config.showMonitoring || config.showKeyboardLayout || config.showDisplaySettings || config.showAudioSettings)) {
-        tabs.push({ key: "settings", label: "servers.dialog.tabs.settings" });
+    if (config.showSettings && (config.showMonitoring || config.showKeyboardLayout || config.showDisplaySettings || config.showAudioSettings || config.showWakeOnLan || config.showTerminalSettings)) {
+        tabs.push({ key: "settings", label: "servers.dialog.tabs.settings", icon: mdiCogOutline });
     }
 
     return tabs;
@@ -134,12 +161,6 @@ export const validateRequiredFields = (type, protocol, name, config) => {
     if (fieldConfig.showIpPort && (!config.ip || !config.port)) return false;
 
     if (fieldConfig.showProtocol && !config.protocol) return false;
-
-    if (fieldConfig.showPveConfig && fieldConfig.pveFields) {
-        for (const field of fieldConfig.pveFields) {
-            if (field === "vmid" && !config[field]) return false;
-        }
-    }
 
     return true;
 };

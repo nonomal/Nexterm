@@ -1,9 +1,14 @@
 import { createContext, useEffect, useState } from "react";
 import LoginDialog from "@/common/components/LoginDialog";
+import ConnectorSetup from "@/common/components/ConnectorSetup";
 import { getRequest, postRequest } from "@/common/utils/RequestUtil.js";
 import { useLocation, useNavigate } from "react-router-dom";
 import { useToast } from "@/common/contexts/ToastContext.jsx";
-import { isTauri, getActiveServerUrl } from "@/common/utils/TauriUtil.js";
+import { isTauri, getActiveServerUrl, setActiveServerUrl } from "@/common/utils/TauriUtil.js";
+import {
+    getServers, getActiveServerId,
+    removeServer, updateServerToken, switchServer as switchServerUtil
+} from "@/common/utils/ConnectorServers.js";
 
 export const UserContext = createContext({});
 
@@ -18,11 +23,16 @@ export const UserProvider = ({ children }) => {
         || localStorage.getItem("sessionToken"));
     const [firstTimeSetup, setFirstTimeSetup] = useState(false);
     const [user, setUser] = useState(null);
+    const [addingServer, setAddingServer] = useState(false);
     const {sendToast} = useToast();
 
     const updateSessionToken = (sessionToken) => {
         setSessionToken(sessionToken);
         localStorage.setItem("sessionToken", sessionToken);
+
+        const activeId = getActiveServerId();
+        if (activeId) updateServerToken(activeId, sessionToken);
+
         login();
     };
 
@@ -53,12 +63,26 @@ export const UserProvider = ({ children }) => {
     };
 
     const logout = async () => {
-        await postRequest("auth/logout", { token: sessionToken });
+        try {
+            await postRequest("auth/logout", { token: sessionToken });
+        } catch {}
 
-        if (localStorage.getItem("overrideToken")) {
-            localStorage.removeItem("overrideToken");
+        if (isConnectorMode) {
+            const activeId = getActiveServerId();
+            if (activeId) removeServer(activeId);
+
+            const remaining = getServers();
+            if (remaining.length > 0) {
+                switchServerUtil(remaining[0].id);
+                return;
+            }
+
+            setActiveServerUrl(null);
+            localStorage.removeItem("nexterm_active_server");
         }
 
+        localStorage.removeItem("sessionToken");
+        localStorage.removeItem("overrideToken");
         window.location.reload();
     };
 
@@ -67,6 +91,9 @@ export const UserProvider = ({ children }) => {
         setSessionToken(token);
         login();
     };
+
+    const hasPermission = (permission) =>
+        !!user && (user.isAdmin || (user.permissions || []).includes(permission));
 
     useEffect(() => {
         const searchParams = new URLSearchParams(location.search);
@@ -88,8 +115,12 @@ export const UserProvider = ({ children }) => {
     }, [sessionToken]);
 
     return (
-        <UserContext.Provider value={{ updateSessionToken, user, sessionToken, firstTimeSetup, login, logout, overrideToken }}>
-            <LoginDialog open={!sessionToken} />
+        <UserContext.Provider value={{ updateSessionToken, user, sessionToken, firstTimeSetup, login, logout, overrideToken, hasPermission, isConnectorMode, addingServer, setAddingServer }}>
+            {isConnectorMode ? (
+                <ConnectorSetup open={!sessionToken || addingServer} isAddMode={addingServer} onCancelAdd={() => setAddingServer(false)} />
+            ) : (
+                <LoginDialog open={!sessionToken} />
+            )}
             {children}
         </UserContext.Provider>
     );

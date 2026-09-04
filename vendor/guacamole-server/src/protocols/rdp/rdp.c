@@ -77,6 +77,9 @@
 #include <stdlib.h>
 #include <time.h>
 
+#define GUAC_RDP_EVENT_DRAIN_LIMIT 64
+#define GUAC_RDP_EVENT_DRAIN_BACKOFF 1
+
 /**
  * Initializes and loads the necessary FreeRDP plugins based on the current
  * RDP session settings. This function is designed to work in environments
@@ -541,6 +544,10 @@ static int guac_rdp_handle_connection(guac_client* client) {
     /* Init client */
     freerdp* rdp_inst = freerdp_new();
 
+    /* Whether freerdp_context_new() succeeded, and the context therefore still
+     * needs to be freed if the connection attempt fails */
+    int context_created = 0;
+
     /*
      * If the freerdp instance has a LoadChannels callback for loading plugins
      * we use that instead of the PreConnect callback to load plugins.
@@ -568,6 +575,8 @@ static int guac_rdp_handle_connection(guac_client* client) {
         goto fail;
     }
 
+    context_created = 1;
+
     ((rdp_freerdp_context*) GUAC_RDP_CONTEXT(rdp_inst))->client = client;
 
     /* Load keymap into client */
@@ -577,7 +586,12 @@ static int guac_rdp_handle_connection(guac_client* client) {
     /* Set default pointer */
     guac_display_set_cursor(rdp_client->display, GUAC_DISPLAY_CURSOR_POINTER);
 
-    /* 
+    /* Expose the instance so that teardown can interrupt the connection attempt
+     * below (see guac_rdp_client_free_handler()). Assigned while the write lock
+     * is still held. */
+    rdp_client->connecting_inst = rdp_inst;
+
+    /*
      * Downgrade the lock to allow for concurrent read access.
      * Access to read locks needs to be made available for other processes such
      * as the join_pending_handler to use while we await credentials from the user.
@@ -594,6 +608,10 @@ static int guac_rdp_handle_connection(guac_client* client) {
     /* Upgrade to write lock again for further exclusive operations */
     guac_rwlock_release_lock(&(rdp_client->lock));
     guac_rwlock_acquire_write_lock(&(rdp_client->lock));
+
+    /* The connection attempt is over and rdp_inst is about to become the
+     * established instance */
+    rdp_client->connecting_inst = NULL;
 
     /* Connection complete */
     rdp_client->rdp_inst = rdp_inst;
@@ -618,13 +636,18 @@ static int guac_rdp_handle_connection(guac_client* client) {
         if (wait_result < 0)
             break;
 
-        int connection_closing;
+        int connection_closing = 0;
+        int drained_events = 0;
         do {
 
             /* Handle any queued FreeRDP events (this may result in RDP messages
              * being sent), aborting later if FreeRDP event handling fails */
-            if (!guac_rdp_handle_events(rdp_client))
+            if (!guac_rdp_handle_events(rdp_client)) {
                 wait_result = -1;
+                break;
+            }
+
+            drained_events++;
 
             /* Test whether the RDP server is closing the connection */
 #ifdef HAVE_DISCONNECT_CONTEXT
@@ -634,7 +657,11 @@ static int guac_rdp_handle_connection(guac_client* client) {
 #endif
 
         } while (!connection_closing &&
+                drained_events < GUAC_RDP_EVENT_DRAIN_LIMIT &&
                 (wait_result = rdp_guac_client_wait_for_events(client, 0)) > 0);
+
+        if (!connection_closing && wait_result > 0)
+            guac_timestamp_msleep(GUAC_RDP_EVENT_DRAIN_BACKOFF);
 
         /* Notify display of any changes to the GDI that may have occurred
          * while handling events/messages */
@@ -663,6 +690,14 @@ static int guac_rdp_handle_connection(guac_client* client) {
     if (rdp_client->active_job != NULL) {
         guac_rdp_print_job_kill(rdp_client->active_job);
         guac_rdp_print_job_free(rdp_client->active_job);
+    }
+
+    /* Ensure any in-progress GDI paint is flushed and the raw context is
+     * closed before teardown manipulates the default layer or frees GDI. */
+    if (rdp_client->current_context != NULL) {
+        guac_client_log(client, GUAC_LOG_WARNING,
+                "Disconnecting with pending paint context; forcing EndPaint before teardown");
+        guac_rdp_gdi_end_paint(rdp_inst->context);
     }
 
     /* Disconnect client and channels */
@@ -717,6 +752,47 @@ static int guac_rdp_handle_connection(guac_client* client) {
     return 0;
 
 fail:
+
+    /* Take the write lock for exclusive access while tearing down, as the
+     * connect failure path may still hold only a read lock */
+    guac_rwlock_release_lock(&(rdp_client->lock));
+    guac_rwlock_acquire_write_lock(&(rdp_client->lock));
+
+    /* The connection attempt is over. Clear this before rdp_inst is freed below
+     * so that teardown can never abort through a dangling instance. */
+    rdp_client->connecting_inst = NULL;
+
+    /* Drop the guac_display's reference to FreeRDP's GDI buffer before that
+     * buffer is freed along with the context */
+    if (context_created && default_layer != NULL) {
+        guac_display_layer_raw_context* fail_context =
+            guac_display_layer_open_raw(default_layer);
+        fail_context->buffer = NULL;
+        guac_display_layer_close_raw(default_layer, fail_context);
+    }
+
+    /* Free the FreeRDP instance and its context, including its WinPR thread
+     * pool. This is safe to do here because rdp_inst was never published to
+     * rdp_client->rdp_inst, so no other thread can reach it.
+     *
+     * The GDI is deliberately NOT freed: the connection never completed, so
+     * FreeRDP still owns whatever GDI state it created and releases it as part
+     * of freerdp_context_free(). Calling gdi_free() here double-frees and
+     * corrupts the heap. */
+    if (context_created)
+        freerdp_context_free(rdp_inst);
+
+    if (rdp_inst != NULL)
+        freerdp_free(rdp_inst);
+
+    /* NOTE: the guac_display, the keyboard, and the SVC list are deliberately
+     * NOT freed here, even though a failed attempt allocated them. Users may
+     * still be joined to this client and may touch them concurrently from their
+     * own threads (e.g. guac_rdp_user_leave_handler ->
+     * guac_display_notify_user_left). They are freed instead by
+     * guac_rdp_client_free_handler, which runs only once every user has been
+     * removed. */
+
     guac_rwlock_release_lock(&(rdp_client->lock));
     return 1;
 
@@ -796,7 +872,7 @@ void* guac_rdp_client_thread(void* data) {
         rdp_client->filesystem =
             guac_rdp_fs_alloc(client, settings->drive_path,
                     settings->create_drive_path, settings->disable_download,
-                    settings->disable_upload);
+                    settings->disable_upload, settings->drive_backend);
 
         /* Expose filesystem to owner */
         guac_client_for_owner(client, guac_rdp_fs_expose,

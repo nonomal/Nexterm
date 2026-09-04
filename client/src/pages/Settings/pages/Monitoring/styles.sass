@@ -1,4 +1,5 @@
 @use "@/common/styles/colors"
+@use "@/common/styles/breakpoints"
 
 .monitoring-settings
   display: flex
@@ -16,6 +17,10 @@
     margin: 0 0 0.5rem 0
     color: colors.$white
     font-size: 1.25rem
+
+    @media (max-width: breakpoints.$mobile)
+      font-size: 1.1rem
+
   > p
     margin: 0 0 1.5rem 0
     color: colors.$subtext
@@ -27,11 +32,21 @@
   justify-content: space-between
   padding: 1rem 0
   border-bottom: 1px solid colors.$gray
+
+  @media (max-width: breakpoints.$mobile)
+    flex-direction: column
+    gap: 0.75rem
+
   &:last-child
     border-bottom: none
+
   .setting-label
     flex: 1
     margin-right: 2rem
+
+    @media (max-width: breakpoints.$mobile)
+      margin-right: 0
+
     h4
       margin: 0 0 0.25rem 0
       color: colors.$white
@@ -46,6 +61,10 @@
   display: flex
   align-items: center
   gap: 0.5rem
+
+  @media (max-width: breakpoints.$mobile)
+    width: 100%
+
   input
     width: 80px
     padding: 0.6rem 0.8rem
@@ -56,6 +75,10 @@
     font-size: 14pt
     outline: none
     text-align: center
+
+    @media (max-width: breakpoints.$mobile)
+      flex: 1
+
     &:focus
       border-color: colors.$primary
     &::-webkit-inner-spin-button, &::-webkit-outer-spin-button
@@ -69,3 +92,9 @@
   justify-content: flex-end
   padding-top: 2rem
   border-top: 1px solid colors.$gray
+
+  @media (max-width: breakpoints.$mobile)
+    justify-content: stretch
+
+    button
+      flex: 1

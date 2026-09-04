@@ -3,7 +3,7 @@ import SelectBox from "@/common/components/SelectBox";
 import ToggleSwitch from "@/common/components/ToggleSwitch";
 import { ServerContext } from "@/common/contexts/ServerContext.jsx";
 import Icon from "@mdi/react";
-import { mdiServerNetwork, mdiClose, mdiPlus, mdiChartLine, mdiMonitor, mdiPalette, mdiVolumeHigh, mdiPowerPlug } from "@mdi/js";
+import { mdiServerNetwork, mdiClose, mdiPlus, mdiChartLine, mdiMonitor, mdiPalette, mdiVolumeHigh, mdiPowerPlug, mdiKeyboardOutline, mdiShieldLock } from "@mdi/js";
 import { useTranslation } from "react-i18next";
 
 const COLOR_DEPTHS = [
@@ -20,24 +20,50 @@ const RESIZE_METHODS = [
     { label: "None", value: "none" },
 ];
 
+const BACKSPACE_MODES = [
+    { label: "DEL", value: "del" },
+    { label: "^H", value: "ctrl-h" },
+];
+
+const DELETE_MODES = [
+    { label: "VT", value: "vt" },
+    { label: "DEL", value: "del" },
+];
+
+const FUNCTION_KEY_MODES = [
+    { label: "Xterm", value: "xterm" },
+    { label: "VT", value: "vt" },
+    { label: "Linux", value: "linux" },
+];
+
+const RDP_SECURITY_METHODS = [
+    { label: "Auto (negotiate best)", value: "" },
+    { label: "Any (highest available)", value: "any" },
+    { label: "NLA (Kerberos / CredSSP)", value: "nla" },
+    { label: "TLS (SSL)", value: "tls" },
+    { label: "RDP (NTLM)", value: "rdp" },
+    { label: "Hyper-V (vmconnect)", value: "vmconnect" },
+];
+
 const KEYBOARD_LAYOUTS = [
-    { label: "Dänisch (Qwerty)", value: "da-dk-qwerty" },
+    { label: "Čeština (Qwertz)", value: "cs-cz-qwertz" },
+    { label: "Dänish (Qwerty)", value: "da-dk-qwerty" },
     { label: "Swiss German (Qwertz)", value: "de-ch-qwertz" },
     { label: "Deutsch (Qwertz)", value: "de-de-qwertz" },
     { label: "English (GB) (Qwerty)", value: "en-gb-qwerty" },
     { label: "English (US) (Qwerty)", value: "en-us-qwerty" },
-    { label: "Spanisch (Qwerty)", value: "es-es-qwerty" },
-    { label: "Latin American (Qwerty)", value: "es-latam-qwerty" },
+    { label: "Spanish (Qwerty)", value: "es-es-qwerty" },
+    { label: "Spanish (Latin America) (Qwerty)", value: "es-latam-qwerty" },
     { label: "Unicode", value: "failsafe" },
     { label: "Belgian French (Azerty)", value: "fr-be-azerty" },
     { label: "Schweiz/Französisch (Qwertz)", value: "fr-ch-qwertz" },
-    { label: "Französisch (Azerty)", value: "fr-fr-azerty" },
+    { label: "French (Azerty)", value: "fr-fr-azerty" },
     { label: "Hungarian (Qwertz)", value: "hu-hu-qwertz" },
-    { label: "Italienisch (Qwerty)", value: "it-it-qwerty" },
-    { label: "Japanisch (Qwerty)", value: "ja-jp-qwerty" },
-    { label: "Portugiesisch (BR) (Qwerty)", value: "pt-br-qwerty" },
-    { label: "Schwedisch (Qwerty)", value: "sv-se-qwerty" },
-    { label: "Türkisch (Qwerty)", value: "tr-tr-qwerty" }
+    { label: "Italian (Qwerty)", value: "it-it-qwerty" },
+    { label: "Japanese (Qwerty)", value: "ja-jp-qwerty" },
+    { label: "Portuguese-Brazil (BR) (Qwerty)", value: "pt-br-qwerty" },
+    { label: "Swedish (Qwerty)", value: "sv-se-qwerty" },
+    { label: "Turkish (Qwerty)", value: "tr-tr-qwerty" }
 ];
 
 const SettingsPage = ({ config, setConfig, monitoringEnabled, setMonitoringEnabled, fieldConfig, editServerId }) => {
@@ -56,6 +82,11 @@ const SettingsPage = ({ config, setConfig, monitoringEnabled, setMonitoringEnabl
     const [enableFullWindowDrag, setEnableFullWindowDrag] = useState(config?.enableFullWindowDrag === true);
     const [enableDesktopComposition, setEnableDesktopComposition] = useState(config?.enableDesktopComposition === true);
     const [enableMenuAnimations, setEnableMenuAnimations] = useState(config?.enableMenuAnimations === true);
+    const [wakeOnLanEnabled, setWakeOnLanEnabled] = useState(config?.wakeOnLanEnabled === true);
+    const [rdpSecurity, setRdpSecurity] = useState(config?.rdpSecurity || "");
+    const [backspaceMode, setBackspaceMode] = useState(config?.backspaceMode || "del");
+    const [deleteMode, setDeleteMode] = useState(config?.deleteMode || "vt");
+    const [functionKeyMode, setFunctionKeyMode] = useState(config?.functionKeyMode || "xterm");
 
     const handleKeyboardLayoutChange = (newLayout) => {
         setKeyboardLayout(newLayout);
@@ -81,6 +112,11 @@ const SettingsPage = ({ config, setConfig, monitoringEnabled, setMonitoringEnabl
         if (config?.enableFullWindowDrag !== undefined) setEnableFullWindowDrag(config.enableFullWindowDrag);
         if (config?.enableDesktopComposition !== undefined) setEnableDesktopComposition(config.enableDesktopComposition);
         if (config?.enableMenuAnimations !== undefined) setEnableMenuAnimations(config.enableMenuAnimations);
+        if (config?.wakeOnLanEnabled !== undefined) setWakeOnLanEnabled(config.wakeOnLanEnabled);
+        if (config?.rdpSecurity !== undefined) setRdpSecurity(config.rdpSecurity);
+        if (config?.backspaceMode !== undefined) setBackspaceMode(config.backspaceMode);
+        if (config?.deleteMode !== undefined) setDeleteMode(config.deleteMode);
+        if (config?.functionKeyMode !== undefined) setFunctionKeyMode(config.functionKeyMode);
     }, [config]);
 
     useEffect(() => {
@@ -136,7 +172,7 @@ const SettingsPage = ({ config, setConfig, monitoringEnabled, setMonitoringEnabl
 
     const showJumpHosts = config?.protocol === 'ssh';
 
-    if (!fieldConfig.showMonitoring && !fieldConfig.showKeyboardLayout && !fieldConfig.showDisplaySettings && !fieldConfig.showAudioSettings && !showJumpHosts) {
+    if (!fieldConfig.showMonitoring && !fieldConfig.showKeyboardLayout && !fieldConfig.showDisplaySettings && !fieldConfig.showAudioSettings && !fieldConfig.showWakeOnLan && !fieldConfig.showTerminalSettings && !showJumpHosts) {
         return <p className="text-center">{t('servers.dialog.settings.noSettings')}</p>;
     }
 
@@ -216,6 +252,88 @@ const SettingsPage = ({ config, setConfig, monitoringEnabled, setMonitoringEnabl
                         </span>
                     </div>
                     <ToggleSwitch checked={monitoringEnabled} onChange={setMonitoringEnabled} id="monitoring-toggle" />
+                </div>
+            )}
+
+            {fieldConfig.showWakeOnLan && (
+                <div className="settings-toggle">
+                    <div className="settings-toggle-info">
+                        <span className="settings-toggle-label">
+                            <Icon path={mdiPowerPlug} size={0.8} style={{ marginRight: '8px', verticalAlign: 'middle' }} />
+                            {t('servers.dialog.settings.wakeOnLan.title')}
+                        </span>
+                        <span className="settings-toggle-description">
+                            {t('servers.dialog.settings.wakeOnLan.description')}
+                        </span>
+                    </div>
+                    <ToggleSwitch checked={wakeOnLanEnabled} onChange={(val) => handleDisplaySettingChange('wakeOnLanEnabled', val, setWakeOnLanEnabled)} id="wake-on-lan-toggle" />
+                </div>
+            )}
+
+            {fieldConfig.showTerminalSettings && (
+                <div className="jump-hosts-section">
+                    <div className="jump-hosts-header">
+                        <div className="jump-hosts-info">
+                            <span className="jump-hosts-label">
+                                <Icon path={mdiKeyboardOutline} size={0.8} style={{ marginRight: '8px', verticalAlign: 'middle' }} />
+                                {t('servers.dialog.settings.terminal.title')}
+                            </span>
+                            <span className="jump-hosts-description">
+                                {t('servers.dialog.settings.terminal.description')}
+                            </span>
+                        </div>
+                    </div>
+
+                    <div className="terminal-settings-grid">
+                        <div className="form-group">
+                            <label>{t('servers.dialog.settings.terminal.backspace')}</label>
+                            <SelectBox 
+                                options={BACKSPACE_MODES} 
+                                selected={backspaceMode} 
+                                setSelected={(val) => handleDisplaySettingChange('backspaceMode', val, setBackspaceMode)} 
+                            />
+                        </div>
+                        <div className="form-group">
+                            <label>{t('servers.dialog.settings.terminal.delete')}</label>
+                            <SelectBox 
+                                options={DELETE_MODES} 
+                                selected={deleteMode} 
+                                setSelected={(val) => handleDisplaySettingChange('deleteMode', val, setDeleteMode)} 
+                            />
+                        </div>
+                        <div className="form-group">
+                            <label>{t('servers.dialog.settings.terminal.functionKeys')}</label>
+                            <SelectBox 
+                                options={FUNCTION_KEY_MODES} 
+                                selected={functionKeyMode} 
+                                setSelected={(val) => handleDisplaySettingChange('functionKeyMode', val, setFunctionKeyMode)} 
+                            />
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {fieldConfig.showRdpSecurity && (
+                <div className="jump-hosts-section">
+                    <div className="jump-hosts-header">
+                        <div className="jump-hosts-info">
+                            <span className="jump-hosts-label">
+                                <Icon path={mdiShieldLock} size={0.8} style={{ marginRight: '8px', verticalAlign: 'middle' }} />
+                                {t('servers.dialog.settings.rdpSecurity.title')}
+                            </span>
+                            <span className="jump-hosts-description">
+                                {t('servers.dialog.settings.rdpSecurity.description')}
+                            </span>
+                        </div>
+                    </div>
+                    <div className="form-group">
+                        <label>{t('servers.dialog.settings.rdpSecurity.method')}</label>
+                        <SelectBox
+                            options={RDP_SECURITY_METHODS}
+                            selected={rdpSecurity}
+                            setSelected={(val) => handleDisplaySettingChange('rdpSecurity', val, setRdpSecurity)}
+                        />
+                    </div>
                 </div>
             )}
 

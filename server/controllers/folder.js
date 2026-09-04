@@ -1,12 +1,58 @@
 const Folder = require("../models/Folder");
 const Entry = require("../models/Entry");
+const EntryIdentity = require("../models/EntryIdentity");
+const Identity = require("../models/Identity");
 const Organization = require("../models/Organization");
 const OrganizationMember = require("../models/OrganizationMember");
 const { Op } = require("sequelize");
-const { hasOrganizationAccess } = require("../utils/permission");
+const { hasOrganizationAccess, hasOrganizationPermission, hasAccountPermission } = require("../utils/permission");
+const { Permission } = require("../permissions/registry");
 const { createAuditLog, AUDIT_ACTIONS, RESOURCE_TYPES } = require("./audit");
+const stateBroadcaster = require("../lib/StateBroadcaster");
+const logger = require("../utils/logger");
+const SessionManager = require("../lib/SessionManager");
 
-const updateFolderContext = async (folderId, organizationId, accountId) => {
+const cleanupOrganizationIdentities = async (entryIds, oldOrganizationId) => {
+    if (!entryIds.length || !oldOrganizationId) return;
+
+    for (const entryId of entryIds) {
+        await SessionManager.removeAllByEntryId(entryId);
+    }
+
+    const entryIdentities = await EntryIdentity.findAll({
+        where: { entryId: { [Op.in]: entryIds } }
+    });
+    const identityIds = [...new Set(entryIdentities.map(ei => ei.identityId))];
+
+    if (identityIds.length > 0) {
+        const oldOrgIdentities = await Identity.findAll({
+            where: {
+                id: { [Op.in]: identityIds },
+                organizationId: oldOrganizationId,
+            }
+        });
+
+        const oldOrgIdentityIds = oldOrgIdentities.map(i => i.id);
+        if (oldOrgIdentityIds.length > 0) {
+            await EntryIdentity.destroy({
+                where: {
+                    entryId: { [Op.in]: entryIds },
+                    identityId: { [Op.in]: oldOrgIdentityIds }
+                }
+            });
+            logger.info(`Removed organization identities from entries after folder move`, { 
+                entryCount: entryIds.length, 
+                identityCount: oldOrgIdentityIds.length, 
+                oldOrganizationId 
+            });
+        }
+    }
+};
+
+const updateFolderContext = async (folderId, organizationId, accountId, oldOrganizationId = null) => {
+    const entries = await Entry.findAll({ where: { folderId }, attributes: ['id'] });
+    const entryIds = entries.map(e => e.id);
+
     await Folder.update(
         { organizationId, accountId },
         { where: { id: folderId } }
@@ -17,9 +63,13 @@ const updateFolderContext = async (folderId, organizationId, accountId) => {
         { where: { folderId } }
     );
 
+    if (oldOrganizationId && oldOrganizationId !== organizationId) {
+        await cleanupOrganizationIdentities(entryIds, oldOrganizationId);
+    }
+
     const subfolders = await Folder.findAll({ where: { parentId: folderId } });
     for (const subfolder of subfolders) {
-        await updateFolderContext(subfolder.id, organizationId, accountId);
+        await updateFolderContext(subfolder.id, organizationId, accountId, oldOrganizationId);
     }
 };
 
@@ -36,10 +86,12 @@ module.exports.createFolder = async (accountId, configuration) => {
     }
 
     if (configuration.organizationId) {
-        const hasAccess = await hasOrganizationAccess(accountId, configuration.organizationId);
+        const hasAccess = await hasOrganizationPermission(accountId, configuration.organizationId, Permission.RESOURCES_MANAGE);
         if (!hasAccess) {
-            return { code: 403, message: "You don't have access to this organization" };
+            return { code: 403, message: "You don't have permission to manage resources in this organization" };
         }
+    } else if (!(await hasAccountPermission(accountId, Permission.RESOURCES_MANAGE))) {
+        return { code: 403, message: "You don't have permission to manage resources" };
     }
 
     if (configuration.parentId) {
@@ -63,13 +115,15 @@ module.exports.createFolder = async (accountId, configuration) => {
     });
 
     await createAuditLog({
-        action: AUDIT_ACTIONS.FOLDER_CREATE_MGMT,
+        action: AUDIT_ACTIONS.FOLDER_MGMT_CREATE,
         accountId,
         organizationId: configuration.organizationId || null,
         resource: RESOURCE_TYPES.FOLDER,
         resourceId: folder.id,
         details: { folderName: configuration.name },
     });
+
+    stateBroadcaster.broadcast("ENTRIES", { accountId, organizationId: configuration.organizationId });
 
     return folder;
 };
@@ -81,13 +135,13 @@ module.exports.deleteFolder = async (accountId, folderId) => {
         return { code: 301, message: "Folder does not exist" };
     }
 
-    if (folder.accountId && folder.accountId !== accountId) {
+    if (folder.organizationId) {
+        if (!(await hasOrganizationPermission(accountId, folder.organizationId, Permission.RESOURCES_MANAGE)))
+            return { code: 403, message: "You don't have permission to manage resources in this organization" };
+    } else if (folder.accountId !== accountId) {
         return { code: 403, message: "You don't have permission to delete this folder" };
-    } else if (folder.organizationId) {
-        const hasAccess = await hasOrganizationAccess(accountId, folder.organizationId);
-        if (!hasAccess) {
-            return { code: 403, message: "You don't have access to this organization" };
-        }
+    } else if (!(await hasAccountPermission(accountId, Permission.RESOURCES_MANAGE))) {
+        return { code: 403, message: "You don't have permission to manage resources" };
     }
 
     let subfolders = await Folder.findAll({ where: { parentId: folderId } });
@@ -100,13 +154,15 @@ module.exports.deleteFolder = async (accountId, folderId) => {
     await Folder.destroy({ where: { id: folderId } });
 
     await createAuditLog({
-        action: AUDIT_ACTIONS.FOLDER_DELETE_MGMT,
+        action: AUDIT_ACTIONS.FOLDER_MGMT_DELETE,
         accountId,
         organizationId: folder.organizationId,
         resource: RESOURCE_TYPES.FOLDER,
         resourceId: folderId,
         details: { folderName: folder.name },
     });
+
+    stateBroadcaster.broadcast("ENTRIES", { accountId, organizationId: folder.organizationId });
 
     return { success: true };
 };
@@ -118,13 +174,17 @@ module.exports.editFolder = async (accountId, folderId, configuration) => {
         return { code: 301, message: "Folder does not exist" };
     }
 
-    if (folder.accountId && folder.accountId !== accountId) {
+    if (folder.organizationId) {
+        if (!(await hasOrganizationPermission(accountId, folder.organizationId, Permission.RESOURCES_MANAGE)))
+            return { code: 403, message: "You don't have permission to manage resources in this organization" };
+    } else if (folder.accountId !== accountId) {
         return { code: 403, message: "You don't have permission to edit this folder" };
-    } else if (folder.organizationId) {
-        const hasAccess = await hasOrganizationAccess(accountId, folder.organizationId);
-        if (!hasAccess) {
-            return { code: 403, message: "You don't have access to this organization's folders" };
-        }
+    } else if (!(await hasAccountPermission(accountId, Permission.RESOURCES_MANAGE))) {
+        return { code: 403, message: "You don't have permission to manage resources" };
+    }
+
+    if (configuration.parentId !== undefined && folder.type === "integration-node") {
+        return { code: 403, message: "Integration nodes cannot be moved out of their integration folder" };
     }
 
     if (configuration.parentId !== undefined) {
@@ -132,9 +192,9 @@ module.exports.editFolder = async (accountId, folderId, configuration) => {
             if (configuration.organizationId !== undefined) {
                 const targetOrgId = configuration.organizationId;
                 if (targetOrgId !== null) {
-                    const hasAccess = await hasOrganizationAccess(accountId, targetOrgId);
+                    const hasAccess = await hasOrganizationPermission(accountId, targetOrgId, Permission.RESOURCES_MANAGE);
                     if (!hasAccess) {
-                        return { code: 403, message: "You don't have access to the target organization" };
+                        return { code: 403, message: "You don't have permission to manage resources in the target organization" };
                     }
                 }
                 
@@ -142,14 +202,14 @@ module.exports.editFolder = async (accountId, folderId, configuration) => {
                 const newAccountId = targetOrgId ? null : accountId;
                 
                 if (folder.organizationId !== newOrganizationId) {
-                    await updateFolderContext(parseInt(folderId), newOrganizationId, newAccountId);
+                    await updateFolderContext(parseInt(folderId), newOrganizationId, newAccountId, folder.organizationId);
                 }
             } else {
                 const newOrganizationId = null;
                 const newAccountId = accountId;
                 
                 if (folder.organizationId !== newOrganizationId) {
-                    await updateFolderContext(parseInt(folderId), newOrganizationId, newAccountId);
+                    await updateFolderContext(parseInt(folderId), newOrganizationId, newAccountId, folder.organizationId);
                 }
             }
         } else {
@@ -159,24 +219,24 @@ module.exports.editFolder = async (accountId, folderId, configuration) => {
             }
 
             if (folder.organizationId && !targetFolder.organizationId) {
-                const hasOrgAccess = await hasOrganizationAccess(accountId, folder.organizationId);
+                const hasOrgAccess = await hasOrganizationPermission(accountId, folder.organizationId, Permission.RESOURCES_MANAGE);
                 if (!hasOrgAccess) {
-                    return { code: 403, message: "You don't have access to this organization's folder" };
+                    return { code: 403, message: "You don't have permission to manage resources in this organization" };
                 }
             }
 
             if (targetFolder.organizationId && !folder.organizationId) {
-                const hasOrgAccess = await hasOrganizationAccess(accountId, targetFolder.organizationId);
+                const hasOrgAccess = await hasOrganizationPermission(accountId, targetFolder.organizationId, Permission.RESOURCES_MANAGE);
                 if (!hasOrgAccess) {
-                    return { code: 403, message: "You don't have access to the target organization" };
+                    return { code: 403, message: "You don't have permission to manage resources in the target organization" };
                 }
             }
 
             if (folder.organizationId && targetFolder.organizationId && targetFolder.organizationId !== folder.organizationId) {
-                const hasSourceAccess = await hasOrganizationAccess(accountId, folder.organizationId);
-                const hasTargetAccess = await hasOrganizationAccess(accountId, targetFolder.organizationId);
+                const hasSourceAccess = await hasOrganizationPermission(accountId, folder.organizationId, Permission.RESOURCES_MANAGE);
+                const hasTargetAccess = await hasOrganizationPermission(accountId, targetFolder.organizationId, Permission.RESOURCES_MANAGE);
                 if (!hasSourceAccess || !hasTargetAccess) {
-                    return { code: 403, message: "You don't have access to one or both organizations" };
+                    return { code: 403, message: "You don't have permission to manage resources in one or both organizations" };
                 }
             } else if (!folder.organizationId && !targetFolder.organizationId) {
                 if (targetFolder.accountId !== accountId) {
@@ -201,7 +261,7 @@ module.exports.editFolder = async (accountId, folderId, configuration) => {
             const newAccountId = targetFolder.organizationId ? null : accountId;
             
             if (folder.organizationId !== newOrganizationId) {
-                await updateFolderContext(parseInt(folderId), newOrganizationId, newAccountId);
+                await updateFolderContext(parseInt(folderId), newOrganizationId, newAccountId, folder.organizationId);
             }
         }
     }
@@ -212,13 +272,15 @@ module.exports.editFolder = async (accountId, folderId, configuration) => {
     await Folder.update(configuration, { where: { id: folderId } });
 
     await createAuditLog({
-        action: AUDIT_ACTIONS.FOLDER_UPDATE_MGMT,
+        action: AUDIT_ACTIONS.FOLDER_MGMT_UPDATE,
         accountId,
         organizationId: folder.organizationId,
         resource: RESOURCE_TYPES.FOLDER,
         resourceId: folderId,
         details: configuration,
     });
+
+    stateBroadcaster.broadcast("ENTRIES", { accountId, organizationId: folder.organizationId });
 
     return { success: true };
 };
@@ -251,6 +313,7 @@ module.exports.listFolders = async (accountId) => {
             name: folder.name,
             type: "folder",
             folderType: folder.type,
+            integrationId: folder.integrationId,
             position: folder.position,
             organizationId: folder.organizationId,
             entries: [],
@@ -291,11 +354,7 @@ module.exports.listFolders = async (accountId) => {
         });
 
         organizations.forEach(org => {
-            let requireConnectionReason = false;
-            if (org.auditSettings) {
-                const settings = typeof org.auditSettings === "string" ? JSON.parse(org.auditSettings) : org.auditSettings;
-                requireConnectionReason = settings.requireConnectionReason || false;
-            }
+            const requireConnectionReason = org.auditSettings?.requireConnectionReason || false;
 
             result.push({
                 id: `org-${org.id}`,

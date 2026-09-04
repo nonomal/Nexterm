@@ -2,19 +2,23 @@ import "./styles.sass";
 import { useKeymaps } from "@/common/contexts/KeymapContext.jsx";
 import { useEffect, useState } from "react";
 import Button from "@/common/components/Button";
-import { mdiRestore, mdiMagnify, mdiRobotOutline, mdiCodeArray, mdiKeyboard, mdiBroadcast, mdiContentCopy, mdiFullscreen } from "@mdi/js";
+import { mdiRestore, mdiMagnify, mdiRobotOutline, mdiCodeArray, mdiKeyboard, mdiBroadcast, mdiContentCopy, mdiFullscreen, mdiFlash, mdiKey, mdiCheckCircleOutline, mdiAutoFix } from "@mdi/js";
 import Icon from "@mdi/react";
 import { useTranslation } from "react-i18next";
 import { useToast } from "@/common/contexts/ToastContext.jsx";
 
 const KEYMAP_ICONS = {
     "search": mdiMagnify,
+    "quick-action": mdiFlash,
     "ai-menu": mdiRobotOutline,
+    "ai-accept-tool": mdiCheckCircleOutline,
+    "ai-command": mdiAutoFix,
     "snippets": mdiCodeArray,
     "keyboard-shortcuts": mdiKeyboard,
     "broadcast": mdiBroadcast,
     "copy": mdiContentCopy,
     "fullscreen": mdiFullscreen,
+    "paste-identity-password": mdiKey,
 };
 
 const KeybindRecorder = ({ action, currentKey, onUpdate, onReset }) => {

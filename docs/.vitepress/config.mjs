@@ -48,7 +48,7 @@ export default defineConfig({
 
         nav: [
             { text: "Home", link: "/" },
-            { text: "Preview", link: "/preview" },
+            { text: "Install", link: "/installation" },
         ],
 
         footer: {
@@ -64,8 +64,30 @@ export default defineConfig({
                 text: "Documentation",
                 items: [
                     { text: "Home", link: "/" },
-                    { text: "Preview", link: "/preview" },
+                    { text: "Screenshots", link: "/screenshots" },
+                    { text: "Install", link: "/installation" },
                     { text: "SSL/HTTPS", link: "/ssl" },
+                    { text: "Reverse Proxy", link: "/reverse-proxy" },
+                    { text: "Remote Browser", link: "/remote-browser" },
+                    {
+                        text: "Authentication",
+                        collapsed: true,
+                        items: [
+                            { text: "OIDC / SSO", link: "/oidc" },
+                            { text: "LDAP", link: "/ldap" },
+                        ],
+                    },
+                    {
+                        text: "Custom Sources",
+                        collapsed: true,
+                        link: "/customsource",
+                        items: [
+                            { text: "Scripts & Snippets", link: "/scripts&snippets" },
+                            { text: "Scripting Variables & Directives", link: "/ScriptingVariables" },
+                        ],
+                    },
+                    { text: "CLI", link: "/cli" },
+                    { text: "Server CLI", link: "/server-cli" },
                     { text: "Contributing", link: "/contributing" },
                     {
                         text: "API Reference",

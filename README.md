@@ -26,9 +26,24 @@ Nexterm is an open-source server management software that allows you to:
 -   Secure access with two-factor authentication and OIDC SSO
 -   Separate users and servers into Organizations
 
-## 🚀 Run preview
+## 📷 Screenshots
 
-You can run a preview of Nexterm by clicking [here](https://docs.nexterm.dev/preview).
+<table>
+  <tr>
+    <td><img src="docs/public/assets/showoff/servers.png" alt="Servers" /></td>
+    <td><img src="docs/public/assets/showoff/connections.png" alt="Connections" /></td>
+    <td><img src="docs/public/assets/showoff/sftp.png" alt="SFTP" /></td>
+  </tr>
+  <tr>
+    <td><img src="docs/public/assets/showoff/snippets.png" alt="Snippets" /></td>
+    <td><img src="docs/public/assets/showoff/monitoring.png" alt="Monitoring" /></td>
+    <td><img src="docs/public/assets/showoff/recordings.png" alt="Recordings" /></td>
+  </tr>
+</table>
+
+## 🚀 Install
+
+You can install Nexterm by clicking [here](https://docs.nexterm.dev/installation).
 
 ## 💻 Development
 
@@ -36,7 +51,16 @@ You can run a preview of Nexterm by clicking [here](https://docs.nexterm.dev/pre
 
 -   Node.js 18+
 -   Yarn
+-   FlatBuffers compiler (`flatc`)
 -   Docker (optional)
+
+Install FlatBuffers:
+
+| Platform | Command |
+|----------|---------|
+| macOS | `brew install flatbuffers` |
+| Ubuntu / Debian | `sudo apt install flatbuffers-compiler` |
+| Windows | `winget install Google.FlatBuffers` |
 
 ### Local Setup
 
@@ -47,6 +71,22 @@ git clone https://github.com/gnmyt/Nexterm.git
 cd Nexterm
 ```
 
+#### Configure environment
+
+Create a local environment file:
+
+```sh
+cp .env.example .env
+```
+
+Make sure `ENCRYPTION_KEY` is set in `.env`.
+
+You can generate a secure key using:
+
+| Platform | Command |
+|----------|---------|
+| macOS / Linux | `openssl rand -hex 32` |
+
 #### Install dependencies
 
 ```sh
@@ -55,21 +95,52 @@ cd client && yarn install
 cd ..
 ```
 
+#### Generate FlatBuffers schemas
+
+```sh
+yarn schema:generate
+```
+
+This step is required before starting the development server.
+
 #### Start development mode
 
 ```sh
 yarn dev
 ```
 
+#### Start an engine
+
+The development server does not automatically start an engine. To connect to servers, an engine must be running separately:
+
+```sh
+yarn dev:engine
+```
+
+If using local engine registration, set `LOCAL_ENGINE_TOKEN` in the server environment and use the same value as `REGISTRATION_TOKEN` for the engine.
+
 ## 🔧 Configuration
+
+### Docker Images
+
+| Image            | Description                                              |
+|------------------|----------------------------------------------------------|
+| `nexterm/aio`    | All-In-One — server, client, and engine bundled together |
+| `nexterm/server` | Server + web client only (requires external engine)      |
+| `nexterm/engine` | Engine only                                              |
 
 The server listens on port 6989 by default. You can modify this behavior using environment variables:
 
--   `SERVER_PORT`: Server listening port (default: 6989)
--   `NODE_ENV`: Runtime environment (development/production)
--   `ENCRYPTION_KEY`: Encryption key for passwords, SSH keys and passphrases (default: Randomly generated key)
--   `AI_SYSTEM_PROMPT`: System prompt for AI features (example: You are a Linux command generator assistant.)
--   `LOG_LEVEL`: Logging level for application and guacd (system/info/verbose/debug/warn/error, default: system)
+- `SERVER_PORT`: Server listening port (default: 6989)
+- `CONTROL_PLANE_PORT`: TCP port for engine communication (default: 7800)
+- `NODE_ENV`: Runtime environment (development/production)
+- `ENCRYPTION_KEY`: Encryption key for passwords, SSH keys and passphrases. Supports Docker secrets via
+  /run/secrets/encryption_key`
+- `AI_SYSTEM_PROMPT`: Extra instructions appended to the AI assistant's system prompt (example: Always explain destructive commands before running them.)
+- `LOG_LEVEL`: Logging level for application and engine (system/info/verbose/debug/warn/error, default: system)
+- `TRUST_PROXY`: Number of reverse proxies in front of Nexterm, so logs and audits show the real client IP instead of the
+  proxy's (default: disabled). Use `1` for a single Nginx/Traefik, or pass trusted addresses (`10.10.10.10,192.168.0.0/16`).
+  Only enable this if your proxy sets `X-Forwarded-For`, otherwise clients can spoof their IP.
 
 ## 🛡️ Security
 
@@ -96,7 +167,11 @@ Contributions are welcome! Please feel free to:
 -   [Report a bug](https://github.com/gnmyt/Nexterm/issues)
 -   [Request a feature](https://github.com/gnmyt/Nexterm/issues)
 
-## License
+## 💜 Powered by
+
+[![JetBrains logo](https://resources.jetbrains.com/storage/products/company/brand/logos/jetbrains.svg)](https://jb.gg/OpenSource)
+
+## 📄 License
 
 Distributed under the MIT license. See `LICENSE` for more information.
 

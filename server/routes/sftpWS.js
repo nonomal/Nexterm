@@ -1,340 +1,268 @@
 const wsAuth = require("../middlewares/wsAuth");
-const { createAuditLog, AUDIT_ACTIONS, RESOURCE_TYPES, updateAuditLogWithSessionDuration } = require("../controllers/audit");
-const { deleteFolderRecursive, searchDirectories, OPERATIONS } = require("../utils/sftpHelpers");
-const { createSSHConnection } = require("../utils/sshConnection");
+const {
+    createAuditLog,
+    AUDIT_ACTIONS,
+    RESOURCE_TYPES,
+    updateAuditLogWithSessionDuration,
+} = require("../controllers/audit");
 const SessionManager = require("../lib/SessionManager");
+const { buildParticipant } = require("../utils/sessionParticipant");
+const { createSFTPConnectionForSession, getSFTPBackgroundClient } = require("../lib/ConnectionService");
+const { hasResourcePermission } = require("../utils/permission");
+const { Permission } = require("../permissions/registry");
+const Entry = require("../models/Entry");
 const logger = require("../utils/logger");
 
-module.exports = async (ws, req) => {
-    const context = await wsAuth(ws, req);
-    if (!context) return;
+const OP = {
+    READY: 0x0, LIST_FILES: 0x1, CREATE_FILE: 0x4, CREATE_FOLDER: 0x5, DELETE_FILE: 0x6,
+    DELETE_FOLDER: 0x7, RENAME_FILE: 0x8, ERROR: 0x9, SEARCH_DIRECTORIES: 0xA,
+    RESOLVE_SYMLINK: 0xB, MOVE_FILES: 0xC, COPY_FILES: 0xD, CHMOD: 0xE,
+    STAT: 0xF, CHECKSUM: 0x10, FOLDER_SIZE: 0x11, PATH_SYNC: 0x12,
+};
 
-    const { entry, identity, user, connectionReason, ipAddress, userAgent, serverSession } = context;
+const CHECKSUM_COMMANDS = { md5: "md5sum", sha1: "sha1sum", sha256: "sha256sum", sha512: "sha512sum" };
+
+const MUTATING_OPS = new Set([
+    OP.CREATE_FILE, OP.CREATE_FOLDER, OP.DELETE_FILE, OP.DELETE_FOLDER,
+    OP.RENAME_FILE, OP.MOVE_FILES, OP.COPY_FILES, OP.CHMOD,
+]);
+
+const escapePath = (p) => `'${p.replaceAll("'", String.raw`'\''`)}'`;
+
+const safeSend = (ws, data) => {
+    if (ws.readyState !== 1) return false;
+    try { ws.send(data); return true; } catch { return false; }
+};
+
+const sendResult = (ws, op, data) => safeSend(ws, Buffer.concat([Buffer.from([op]), Buffer.from(JSON.stringify(data))]));
+const sendAck = (ws, op) => safeSend(ws, Buffer.from([op]));
+const sendError = (ws, msg) => sendResult(ws, OP.ERROR, { message: msg });
+
+const requirePath = (p) => { if (!p?.path) throw new Error("Invalid path"); };
+const requirePaths = (p) => { if (!p?.path || !p?.newPath) throw new Error("Invalid paths"); };
+const requireMultiPaths = (p) => { if (!p?.sources?.length || !p?.destination) throw new Error("Invalid paths"); };
+
+const SHELL_LESS_PROTOCOLS = new Set(["ftp", "ftps"]);
+const TERMINAL_LESS_PROTOCOLS = new Set(["sftp", "ftp", "ftps"]);
+
+const getCapabilities = (entry) => {
+    const protocol = entry.type === "server" ? entry.config?.protocol : entry.type;
+    return {
+        shell: !SHELL_LESS_PROTOCOLS.has(protocol),
+        terminal: !TERMINAL_LESS_PROTOCOLS.has(protocol),
+    };
+};
+
+const requireShell = (capabilities) => {
+    if (!capabilities.shell) throw new Error("This operation is not supported over FTP");
+};
+
+const buildOperationHandlers = (sftp, getBg, ws, logAudit, capabilities) => ({
+    [OP.LIST_FILES]: async (p) => {
+        requirePath(p);
+        sendResult(ws, OP.LIST_FILES, { files: await sftp.listDir(p.path) });
+    },
+    [OP.CREATE_FILE]: async (p) => {
+        requirePath(p);
+        await sftp.writeFile(p.path, Buffer.alloc(0));
+        sendAck(ws, OP.CREATE_FILE);
+        logAudit(AUDIT_ACTIONS.FILE_CREATE, RESOURCE_TYPES.FILE, { filePath: p.path });
+    },
+    [OP.CREATE_FOLDER]: async (p) => {
+        requirePath(p);
+        if (p.recursive) await sftp.mkdirRecursive(p.path);
+        else await sftp.mkdir(p.path);
+        sendAck(ws, OP.CREATE_FOLDER);
+        logAudit(AUDIT_ACTIONS.FOLDER_CREATE, RESOURCE_TYPES.FOLDER, { folderPath: p.path });
+    },
+    [OP.DELETE_FILE]: async (p) => {
+        requirePath(p);
+        await sftp.unlink(p.path);
+        sendAck(ws, OP.DELETE_FILE);
+        logAudit(AUDIT_ACTIONS.FILE_DELETE, RESOURCE_TYPES.FILE, { filePath: p.path });
+    },
+    [OP.DELETE_FOLDER]: async (p) => {
+        requirePath(p);
+        await sftp.rmdir(p.path, true);
+        sendAck(ws, OP.DELETE_FOLDER);
+        logAudit(AUDIT_ACTIONS.FOLDER_DELETE, RESOURCE_TYPES.FOLDER, { folderPath: p.path });
+    },
+    [OP.RENAME_FILE]: async (p) => {
+        requirePaths(p);
+        await sftp.rename(p.path, p.newPath);
+        sendAck(ws, OP.RENAME_FILE);
+        logAudit(AUDIT_ACTIONS.FILE_RENAME, RESOURCE_TYPES.FILE, { oldPath: p.path, newPath: p.newPath });
+    },
+    [OP.SEARCH_DIRECTORIES]: async (p) => {
+        if (!p?.searchPath) throw new Error("Invalid path");
+        sendResult(ws, OP.SEARCH_DIRECTORIES, { directories: await sftp.searchDirs(p.searchPath) });
+    },
+    [OP.RESOLVE_SYMLINK]: async (p) => {
+        requirePath(p);
+        sendResult(ws, OP.RESOLVE_SYMLINK, await sftp.realpath(p.path));
+    },
+    [OP.MOVE_FILES]: async (p) => {
+        requireMultiPaths(p);
+        for (const src of p.sources) {
+            await sftp.rename(src, `${p.destination}/${src.split("/").pop()}`);
+        }
+        sendAck(ws, OP.MOVE_FILES);
+        logAudit(AUDIT_ACTIONS.FILE_RENAME, RESOURCE_TYPES.FILE, { sources: p.sources, destination: p.destination });
+    },
+    [OP.COPY_FILES]: async (p) => {
+        requireMultiPaths(p);
+        requireShell(capabilities);
+        const cmds = p.sources.map((src) => {
+            const dest = `${p.destination}/${src.split("/").pop()}`;
+            return `cp -r ${escapePath(src)} ${escapePath(dest)}`;
+        }).join(" && ");
+        const bg = await getBg();
+        const result = await bg.exec(cmds);
+        if (result.exitCode !== 0) throw new Error(result.stderr.trim() || "Failed to copy files");
+        sendAck(ws, OP.COPY_FILES);
+        logAudit(AUDIT_ACTIONS.FILE_CREATE, RESOURCE_TYPES.FILE, { sources: p.sources, destination: p.destination });
+    },
+    [OP.CHMOD]: async (p) => {
+        if (!p?.path || p?.mode === undefined) throw new Error("Invalid path or mode");
+        await sftp.chmod(p.path, p.mode);
+        sendAck(ws, OP.CHMOD);
+        logAudit(AUDIT_ACTIONS.FILE_CHMOD, RESOURCE_TYPES.FILE, { filePath: p.path, mode: p.mode.toString(8) });
+    },
+    [OP.STAT]: async (p) => {
+        requirePath(p);
+        sendResult(ws, OP.STAT, await sftp.stat(p.path));
+    },
+    [OP.CHECKSUM]: async (p) => {
+        if (!p?.path || !p?.algorithm) throw new Error("Invalid path or algorithm");
+        requireShell(capabilities);
+        const algo = p.algorithm.toLowerCase();
+        const cmd = CHECKSUM_COMMANDS[algo];
+        if (!cmd) throw new Error("Unsupported algorithm");
+        const bg = await getBg();
+        const result = await bg.exec(`${cmd} ${escapePath(p.path)}`);
+        if (result.exitCode !== 0) throw new Error(result.stderr.trim() || "Checksum failed");
+        sendResult(ws, OP.CHECKSUM, { hash: result.stdout.split(/\s+/)[0], algorithm: algo });
+    },
+    [OP.FOLDER_SIZE]: async (p) => {
+        requirePath(p);
+        requireShell(capabilities);
+        const bg = await getBg();
+        const result = await bg.exec(`du -sb ${escapePath(p.path)} 2>/dev/null | cut -f1`);
+        if (result.exitCode !== 0) throw new Error(result.stderr.trim() || "Failed to calculate size");
+        sendResult(ws, OP.FOLDER_SIZE, { size: Number.parseInt(result.stdout.trim(), 10) || 0 });
+    },
+});
+
+const resolveSftpClient = async (sessionId, entryId, userId) => {
+    let conn = SessionManager.getConnection(sessionId);
+    if (!conn?.sftpClient) {
+        const entry = await Entry.findByPk(entryId);
+        await createSFTPConnectionForSession(sessionId, entry, userId);
+        conn = SessionManager.getConnection(sessionId);
+    }
+    return conn?.sftpClient ?? null;
+};
+
+module.exports = async (ws, req) => {
+    const ctx = await wsAuth(ws, req);
+    if (!ctx) return;
+
+    const { entry, user, ipAddress, userAgent, serverSession } = ctx;
+
+    const [canView, canModify] = await Promise.all([
+        hasResourcePermission(user.id, entry.organizationId, Permission.FILES_VIEW),
+        hasResourcePermission(user.id, entry.organizationId, Permission.FILES_MODIFY),
+    ]);
+    if (!canView) {
+        sendError(ws, "You don't have permission to browse files on this server");
+        ws.close(4403);
+        return;
+    }
 
     if (serverSession) SessionManager.resume(serverSession.sessionId);
 
+    const sessionId = serverSession?.sessionId;
+    const auditLogId = serverSession?.auditLogId ?? null;
+    const startTime = Date.now();
+
     try {
-        const connectionStartTime = Date.now();
-        const auditLogId = serverSession?.auditLogId || null;
+        const entryId = serverSession?.entryId ?? entry.id;
+        const sftpClient = await resolveSftpClient(sessionId, entryId, user.id);
+        if (!sftpClient) {
+            sendError(ws, "Failed to establish SFTP connection");
+            ws.close(4002);
+            return;
+        }
 
-        const ssh = await createSSHConnection(entry, identity, ws);
+        const getBg = async () => {
+            const fullEntry = await Entry.findByPk(entryId);
+            try {
+                return await getSFTPBackgroundClient(sessionId, fullEntry, user.id);
+            } catch (err) {
+                logger.warn("Falling back to metadata SFTP client for background op", { sessionId, error: err.message });
+                return sftpClient;
+            }
+        };
 
-        ssh.on("error", async () => {
-            await updateAuditLogWithSessionDuration(auditLogId, connectionStartTime);
-            if (ssh._jumpConnections) ssh._jumpConnections.forEach(conn => conn.ssh.end());
-            ws.close();
-        });
+        SessionManager.addWebSocket(sessionId, ws, false, buildParticipant(ctx));
+
+        const onSftpClose = () => {
+            sendError(ws, "SFTP connection lost");
+            try { ws.close(4001); } catch {}
+        };
+        sftpClient.on("close", onSftpClose);
+
+        const capabilities = getCapabilities(entry);
+        const storedPath = SessionManager.getSftpPath(sessionId);
+        sendResult(ws, OP.READY, { path: storedPath, capabilities });
+
+        const logAudit = (action, resource, details) => {
+            createAuditLog({ accountId: user.id, organizationId: entry.organizationId, action, resource, details, ipAddress, userAgent });
+        };
+        const handlers = buildOperationHandlers(sftpClient, getBg, ws, logAudit, capabilities);
+
+        const messageHandler = async (msg) => {
+            const opCode = msg[0];
+
+            if (opCode === OP.PATH_SYNC) {
+                let payload;
+                try { payload = JSON.parse(msg.slice(1).toString()); } catch {}
+                if (payload?.path) {
+                    SessionManager.setSftpPath(sessionId, payload.path);
+                    const session = SessionManager.get(sessionId);
+                    if (session) {
+                        for (const other of session.connectedWs) {
+                            if (other !== ws && other.readyState === 1) {
+                                sendResult(other, OP.PATH_SYNC, { path: payload.path });
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+
+            const handler = handlers[opCode];
+            if (!handler) return;
+            if (MUTATING_OPS.has(opCode) && !canModify) {
+                sendError(ws, "You don't have permission to modify files on this server");
+                return;
+            }
+            let payload;
+            try { payload = JSON.parse(msg.slice(1).toString()); } catch {}
+            try { await handler(payload); }
+            catch (err) { sendError(ws, err.message || "Operation failed"); }
+        };
+
+        ws.on("message", messageHandler);
 
         ws.on("close", async () => {
-            await updateAuditLogWithSessionDuration(auditLogId, connectionStartTime);
-            
-            if (serverSession) {
-                const session = SessionManager.get(serverSession.sessionId);
-                if (session && session.isHibernated) return;
-
-                SessionManager.remove(serverSession.sessionId);
-            }
-            
-            ssh.end();
-            if (ssh._jumpConnections) ssh._jumpConnections.forEach(conn => conn.ssh.end());
+            sftpClient.removeListener("close", onSftpClose);
+            ws.removeListener("message", messageHandler);
+            SessionManager.removeWebSocket(sessionId, ws);
+            try { await updateAuditLogWithSessionDuration(auditLogId, startTime); } catch {}
         });
-
-        logger.system(`Authorized SFTP connection to ${entry.config.ip} with identity ${identity.name}`, {
-            entryId: entry.id,
-            identityId: identity.id,
-            username: user.username
-        });
-
-        ssh.on("ready", async () => {
-            ssh.sftp((err, sftp) => {
-                if (err) {
-                    logger.error("SFTP error", { error: err.message, entryId: entry.id });
-                    return;
-                }
-
-                if (serverSession) SessionManager.setConnection(serverSession.sessionId, { ssh, sftp, auditLogId });
-
-                ws.send(Buffer.from([OPERATIONS.READY]));
-
-                sftp.on("error", () => {});
-
-                let uploadStream = null;
-                let uploadFilePath = null;
-
-                ws.on("message", (msg) => {
-                    const operation = msg[0];
-                    let payload;
-
-                    try {
-                        payload = JSON.parse(msg.slice(1).toString());
-                    } catch (ignored) {}
-
-                    switch (operation) {
-                        case OPERATIONS.LIST_FILES:
-                            sftp.readdir(payload.path, (err, list) => {
-                                if (err) {
-                                    let errorMessage = "Failed to access directory";
-                                    if (err.code === 2) {
-                                        errorMessage = "Directory does not exist";
-                                    } else if (err.code === 3) {
-                                        errorMessage = "Permission denied - you don't have access to this directory";
-                                    }
-
-                                    ws.send(Buffer.concat([
-                                        Buffer.from([OPERATIONS.ERROR]),
-                                        Buffer.from(JSON.stringify({ message: errorMessage })),
-                                    ]));
-                                    return;
-                                }
-                                const files = list.map(file => {
-                                    const isSymlink = file.longname.startsWith("l");
-                                    const isDirectory = file.longname.startsWith("d");
-                                    return {
-                                        name: file.filename,
-                                        type: isDirectory ? "folder" : "file",
-                                        isSymlink,
-                                        last_modified: file.attrs.mtime,
-                                        size: file.attrs.size,
-                                    };
-                                });
-                                ws.send(Buffer.concat([
-                                    Buffer.from([OPERATIONS.LIST_FILES]),
-                                    Buffer.from(JSON.stringify({ files })),
-                                ]));
-                            });
-                            break;
-
-                        case OPERATIONS.UPLOAD_FILE_START:
-                            if (uploadStream) {
-                                uploadStream.end();
-                            }
-
-                            try {
-                                uploadFilePath = payload.path;
-                                uploadStream = sftp.createWriteStream(payload.path);
-                                uploadStream.on("error", () => {
-                                    uploadStream = null;
-                                    uploadFilePath = null;
-                                    ws.send(Buffer.concat([
-                                        Buffer.from([OPERATIONS.ERROR]),
-                                        Buffer.from(JSON.stringify({ message: "Permission denied - unable to upload file to this location" })),
-                                    ]));
-                                });
-
-                                ws.send(Buffer.from([OPERATIONS.UPLOAD_FILE_START]));
-                            } catch (err) {
-                                uploadStream = null;
-                                uploadFilePath = null;
-                                ws.send(Buffer.concat([
-                                    Buffer.from([OPERATIONS.ERROR]),
-                                    Buffer.from(JSON.stringify({ message: "Failed to start file upload" })),
-                                ]));
-                            }
-                            break;
-
-                        case OPERATIONS.UPLOAD_FILE_CHUNK:
-                            try {
-                                if (uploadStream && !uploadStream.destroyed) {
-                                    uploadStream.write(Buffer.from(payload.chunk, "base64"));
-                                }
-                            } catch (err) {
-                                uploadStream = null;
-                                ws.send(Buffer.concat([
-                                    Buffer.from([OPERATIONS.ERROR]),
-                                    Buffer.from(JSON.stringify({ message: "Failed to write file chunk" })),
-                                ]));
-                            }
-                            break;
-
-                        case OPERATIONS.UPLOAD_FILE_END:
-                            try {
-                                if (uploadStream && !uploadStream.destroyed) {
-                                    const filePath = uploadFilePath;
-                                    uploadStream.end(() => {
-                                        uploadStream = null;
-                                        uploadFilePath = null;
-                                        ws.send(Buffer.from([OPERATIONS.UPLOAD_FILE_END]));
-
-                                        if (filePath) {
-                                            createAuditLog({
-                                                accountId: user.id,
-                                                organizationId: entry.organizationId,
-                                                action: AUDIT_ACTIONS.FILE_UPLOAD,
-                                                resource: RESOURCE_TYPES.FILE,
-                                                details: { filePath },
-                                                ipAddress,
-                                                userAgent,
-                                            });
-                                        }
-                                    });
-                                } else {
-                                    uploadStream = null;
-                                    uploadFilePath = null;
-                                    ws.send(Buffer.concat([
-                                        Buffer.from([OPERATIONS.ERROR]),
-                                        Buffer.from(JSON.stringify({ message: "Upload stream is not available" })),
-                                    ]));
-                                }
-                            } catch (err) {
-                                uploadStream = null;
-                                uploadFilePath = null;
-                                ws.send(Buffer.concat([
-                                    Buffer.from([OPERATIONS.ERROR]),
-                                    Buffer.from(JSON.stringify({ message: "Failed to complete file upload" })),
-                                ]));
-                            }
-                            break;
-
-                        case OPERATIONS.CREATE_FOLDER:
-                            sftp.mkdir(payload.path, (err) => {
-                                if (err) {
-                                    let errorMessage = "Failed to create folder";
-                                    if (err.code === 3) {
-                                        errorMessage = "Permission denied - you don't have permission to create folders here";
-                                    } else if (err.code === 4) {
-                                        errorMessage = "Folder already exists";
-                                    }
-
-                                    ws.send(Buffer.concat([
-                                        Buffer.from([OPERATIONS.ERROR]),
-                                        Buffer.from(JSON.stringify({ message: errorMessage })),
-                                    ]));
-                                    return;
-                                }
-                                ws.send(Buffer.from([OPERATIONS.CREATE_FOLDER]));
-
-                                createAuditLog({
-                                    accountId: user.id,
-                                    organizationId: entry.organizationId,
-                                    action: AUDIT_ACTIONS.FOLDER_CREATE,
-                                    resource: RESOURCE_TYPES.FOLDER,
-                                    details: { folderPath: payload.path },
-                                    ipAddress,
-                                    userAgent,
-                                });
-                            });
-                            break;
-
-                        case OPERATIONS.DELETE_FILE:
-                            sftp.unlink(payload.path, (err) => {
-                                if (err) {
-                                    logger.warn("Delete file error", { error: err.message, path: payload.path });
-                                    return;
-                                }
-                                ws.send(Buffer.from([OPERATIONS.DELETE_FILE]));
-
-                                createAuditLog({
-                                    accountId: user.id,
-                                    organizationId: entry.organizationId,
-                                    action: AUDIT_ACTIONS.FILE_DELETE,
-                                    resource: RESOURCE_TYPES.FILE,
-                                    details: { filePath: payload.path },
-                                    ipAddress,
-                                    userAgent,
-                                });
-                            });
-                            break;
-
-                        case OPERATIONS.DELETE_FOLDER:
-                            deleteFolderRecursive(sftp, payload.path, (err) => {
-                                if (err) {
-                                    logger.warn("Delete folder error", { error: err.message, path: payload.path });
-                                    return;
-                                }
-                                ws.send(Buffer.from([OPERATIONS.DELETE_FOLDER]));
-
-                                createAuditLog({
-                                    accountId: user.id,
-                                    organizationId: entry.organizationId,
-                                    action: AUDIT_ACTIONS.FOLDER_DELETE,
-                                    resource: RESOURCE_TYPES.FOLDER,
-                                    details: { folderPath: payload.path },
-                                    ipAddress,
-                                    userAgent,
-                                });
-                            });
-                            break;
-
-                        case OPERATIONS.RENAME_FILE:
-                            sftp.rename(payload.path, payload.newPath, (err) => {
-                                if (err) {
-                                    logger.warn("Rename file error", { error: err.message, path: payload.path, newPath: payload.newPath });
-                                    return;
-                                }
-                                ws.send(Buffer.from([OPERATIONS.RENAME_FILE]));
-
-                                createAuditLog({
-                                    accountId: user.id,
-                                    organizationId: entry.organizationId,
-                                    action: AUDIT_ACTIONS.FILE_RENAME,
-                                    resource: RESOURCE_TYPES.FILE,
-                                    details: {
-                                        oldPath: payload.path,
-                                        newPath: payload.newPath,
-                                    },
-                                    ipAddress,
-                                    userAgent,
-                                });
-                            });
-                            break;
-
-                        case OPERATIONS.SEARCH_DIRECTORIES:
-                            searchDirectories(sftp, payload.searchPath, (err, directories) => {
-                                if (err) {
-                                    ws.send(Buffer.concat([
-                                        Buffer.from([OPERATIONS.ERROR]),
-                                        Buffer.from(JSON.stringify({ message: "Failed to search directories" })),
-                                    ]));
-                                    return;
-                                }
-
-                                ws.send(Buffer.concat([
-                                    Buffer.from([OPERATIONS.SEARCH_DIRECTORIES]),
-                                    Buffer.from(JSON.stringify({ directories })),
-                                ]));
-                            });
-                            break;
-
-                        case OPERATIONS.RESOLVE_SYMLINK:
-                            sftp.realpath(payload.path, (err, realPath) => {
-                                if (err) {
-                                    ws.send(Buffer.concat([
-                                        Buffer.from([OPERATIONS.ERROR]),
-                                        Buffer.from(JSON.stringify({ message: "Failed to resolve symbolic link" })),
-                                    ]));
-                                    return;
-                                }
-                                sftp.stat(realPath, (err, stats) => {
-                                    if (err) {
-                                        ws.send(Buffer.concat([
-                                            Buffer.from([OPERATIONS.ERROR]),
-                                            Buffer.from(JSON.stringify({ message: "Failed to access symbolic link target" })),
-                                        ]));
-                                        return;
-                                    }
-                                    ws.send(Buffer.concat([
-                                        Buffer.from([OPERATIONS.RESOLVE_SYMLINK]),
-                                        Buffer.from(JSON.stringify({ 
-                                            path: realPath,
-                                            isDirectory: stats.isDirectory()
-                                        })),
-                                    ]));
-                                });
-                            });
-                            break;
-
-                        default:
-                            logger.warn(`Unknown SFTP operation`, { operation });
-                    }
-                });
-
-                ws.on("close", async () => {
-                    await updateAuditLogWithSessionDuration(auditLogId, connectionStartTime);
-                });
-            });
-        });
-    } catch (error) {
-        logger.error("SFTP connection error", { error: error.message, stack: error.stack });
-        ws.close(4005, error.message);
+    } catch (err) {
+        sendError(ws, "Connection failed: " + err.message);
+        try { ws.close(4005); } catch {}
     }
 };

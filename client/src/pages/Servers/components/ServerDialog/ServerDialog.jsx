@@ -1,8 +1,9 @@
 import { DialogProvider } from "@/common/components/Dialog";
 import "./styles.sass";
-import { useContext, useEffect, useState, useCallback, useRef } from "react";
+import { useContext, useEffect, useState, useCallback, useRef, useMemo } from "react";
 import DetailsPage from "@/pages/Servers/components/ServerDialog/pages/DetailsPage.jsx";
 import Button from "@/common/components/Button";
+import TabSwitcher from "@/common/components/TabSwitcher";
 import { getRequest, patchRequest, putRequest } from "@/common/utils/RequestUtil.js";
 import { ServerContext } from "@/common/contexts/ServerContext.jsx";
 import IdentityPage from "@/pages/Servers/components/ServerDialog/pages/IdentityPage.jsx";
@@ -12,7 +13,9 @@ import { useToast } from "@/common/contexts/ToastContext.jsx";
 import { useTranslation } from "react-i18next";
 import { getAvailableTabs, validateRequiredFields, getFieldConfig } from "./utils/fieldConfig.js";
 import Icon from "@mdi/react";
-import { mdiServerNetwork, mdiConsole, mdiMonitor, mdiDesktopClassic, mdiServer } from "@mdi/js";
+import * as mdiIcons from "@mdi/js";
+
+const PROTOCOL_DEFAULT_ICONS = { ssh: "mdiConsole", telnet: "mdiConsole", rdp: "mdiMicrosoftWindows", vnc: "mdiMonitor", sftp: "mdiFolderNetwork", ftp: "mdiFolderNetwork", ftps: "mdiFolderNetwork", demo: "mdiFlaskOutline" };
 
 export const ServerDialog = ({ open, onClose, currentFolderId, currentOrganizationId, editServerId, initialProtocol }) => {
     const { t } = useTranslation();
@@ -22,15 +25,8 @@ export const ServerDialog = ({ open, onClose, currentFolderId, currentOrganizati
     const { sendToast } = useToast();
 
     const getProtocolIcon = (protocol, type) => {
-        if (type?.startsWith('pve')) return mdiServerNetwork;
-        
-        const iconMap = {
-            ssh: mdiConsole,
-            telnet: mdiConsole,
-            rdp: mdiMonitor,
-            vnc: mdiDesktopClassic,
-        };
-        return iconMap[protocol] || mdiServerNetwork;
+        if (type?.startsWith('pve')) return "mdiServerNetwork";
+        return { ssh: "mdiConsole", telnet: "mdiConsole", rdp: "mdiMonitor", vnc: "mdiDesktopClassic", sftp: "mdiFolderNetwork", ftp: "mdiFolderNetwork", ftps: "mdiFolderNetwork", demo: "mdiFlaskOutline" }[protocol] || "mdiServerNetwork";
     };
 
     const [name, setName] = useState("");
@@ -71,6 +67,8 @@ export const ServerDialog = ({ open, onClose, currentFolderId, currentOrganizati
             payload.organizationId = identity.organizationId;
         }
         
+        const hasPassphrase = typeof identity.passphrase === "string" && identity.passphrase.length > 0;
+
         if (identity.authType === 'password' || identity.authType === 'password-only') {
             if (identity.passwordTouched || identity.password) {
                 payload.password = identity.password;
@@ -80,12 +78,12 @@ export const ServerDialog = ({ open, onClose, currentFolderId, currentOrganizati
                 payload.password = identity.password;
             }
             payload.sshKey = identity.sshKey;
-            if (identity.passphraseTouched || identity.passphrase) {
+            if (hasPassphrase) {
                 payload.passphrase = identity.passphrase;
             }
         } else {
             payload.sshKey = identity.sshKey;
-            if (identity.passphraseTouched || identity.passphrase) {
+            if (hasPassphrase) {
                 payload.passphrase = identity.passphrase;
             }
         }
@@ -141,9 +139,12 @@ export const ServerDialog = ({ open, onClose, currentFolderId, currentOrganizati
         if (!fieldConfig.showIpPort) {
             delete finalConfig.ip;
             delete finalConfig.port;
+        }
+
+        if (entryType !== "server") {
             delete finalConfig.protocol;
         }
-        
+
         if (!fieldConfig.showKeyboardLayout) {
             delete finalConfig.keyboardLayout;
         }
@@ -213,26 +214,19 @@ export const ServerDialog = ({ open, onClose, currentFolderId, currentOrganizati
         if (editServerId) {
             getRequest("entries/" + editServerId).then((server) => {
                 setName(server.name);
-                setIcon(server.icon || "server");
+                setIcon(server.icon || null);
                 setIdentities(server.identities);
                 setEntryType(server.type || "server");
 
-                try {
-                    const parsedConfig = typeof server.config === 'string' ? JSON.parse(server.config) : server.config || {};
-                    setConfig(parsedConfig);
-                    setMonitoringEnabled(Boolean(parsedConfig.monitoringEnabled ?? true));
-                    initialValues.current = {
-                        name: server.name,
-                        icon: server.icon || 'server',
-                        config: JSON.stringify(parsedConfig),
-                        monitoringEnabled: Boolean(parsedConfig.monitoringEnabled ?? true)
-                    };
-                } catch (error) {
-                    console.error("Failed to parse server config:", error);
-                    setConfig({});
-                    setMonitoringEnabled(false);
-                    initialValues.current = { name: server.name, icon: server.icon || 'server', config: '{}', monitoringEnabled: false };
-                }
+                const parsedConfig = server.config || {};
+                setConfig(parsedConfig);
+                setMonitoringEnabled(Boolean(parsedConfig.monitoringEnabled ?? true));
+                initialValues.current = {
+                    name: server.name,
+                    icon: server.icon || null,
+                    config: JSON.stringify(parsedConfig),
+                    monitoringEnabled: Boolean(parsedConfig.monitoringEnabled ?? true)
+                };
             });
         } else {
             setName("");
@@ -241,13 +235,20 @@ export const ServerDialog = ({ open, onClose, currentFolderId, currentOrganizati
             setEntryType("server");
             
             if (initialProtocol) {
-                setConfig({ protocol: initialProtocol });
-                const iconMap = { ssh: "terminal", telnet: "terminal", rdp: "windows", vnc: "desktop" };
-                setIcon(iconMap[initialProtocol] || null);
+                const portMap = { ssh: "22", telnet: "23", rdp: "3389", vnc: "5900", sftp: "22", ftp: "21", ftps: "21" };
+
+                let initialConfig = { protocol: initialProtocol };
+                if (getFieldConfig("server", initialProtocol).showIpPort) {
+                    initialConfig.port = portMap[initialProtocol] || "";
+                }
+
+                setConfig(initialConfig);
+                const defaultIcon = PROTOCOL_DEFAULT_ICONS[initialProtocol] || null;
+                setIcon(defaultIcon);
                 initialValues.current = { 
                     name: '', 
-                    icon: iconMap[initialProtocol] || null, 
-                    config: JSON.stringify({ protocol: initialProtocol }), 
+                    icon: defaultIcon, 
+                    config: JSON.stringify(initialConfig), 
                     monitoringEnabled: false 
                 };
             } else {
@@ -259,7 +260,7 @@ export const ServerDialog = ({ open, onClose, currentFolderId, currentOrganizati
 
         setIdentityUpdates({});
         setActiveTab(0);
-    }, [open, editServerId, initialProtocol]);
+    }, [open, editServerId, initialProtocol, fieldConfig.showIpPort]);
 
     useEffect(() => {
         if (!open) return;
@@ -282,30 +283,24 @@ export const ServerDialog = ({ open, onClose, currentFolderId, currentOrganizati
         getRequest("servers/" + editServerId).then((server) => setIdentities(server.identities));
     };
 
-    useEffect(() => {
-        if (!open || !fieldConfig.showIpPort || editServerId) return;
-
-        const portMap = { ssh: "22", telnet: "23", rdp: "3389", vnc: "5900" };
-        const currentPort = config.port;
-        const expectedPort = portMap[config.protocol];
-
-        if (expectedPort && !currentPort) {
-            setConfig(prev => ({ ...prev, port: expectedPort }));
-        }
-    }, [config.protocol, open, fieldConfig.showIpPort, editServerId]);
-
     const isDirty = name !== initialValues.current.name || 
                      icon !== initialValues.current.icon ||
                      JSON.stringify(config) !== initialValues.current.config ||
                      monitoringEnabled !== initialValues.current.monitoringEnabled ||
                      Object.keys(identityUpdates).length > 0;
 
+    const tabSwitcherTabs = useMemo(() => tabs.map((tab, index) => ({
+        key: index.toString(),
+        label: t(tab.label),
+        icon: tab.icon
+    })), [tabs, t]);
+
     return (
         <DialogProvider open={open} onClose={onClose} isDirty={isDirty}>
             <div className="server-dialog">
                 <div className="server-dialog-header">
                     <div className="dialog-icon">
-                        <Icon path={getProtocolIcon(config.protocol, entryType)} size={1} />
+                        <Icon path={mdiIcons[getProtocolIcon(config.protocol, entryType)] || mdiIcons.mdiServerNetwork} size={1} />
                     </div>
                     <div className="server-dialog-title">
                         <h2>
@@ -329,16 +324,18 @@ export const ServerDialog = ({ open, onClose, currentFolderId, currentOrganizati
                     </div>
                 </div>
 
-                <div className="server-dialog-tabs">
-                    {tabs.length > 1 && tabs.map((tab, index) => (
-                        <div key={index} className={`tabs-item ${activeTab === index ? "tabs-item-active" : ""}`}
-                             onClick={() => setActiveTab(index)}>
-                            <h3>{t(tab.label)}</h3>
-                        </div>
-                    ))}
-                </div>
+                {tabs.length > 1 && (
+                    <div className="server-dialog-tabs">
+                        <TabSwitcher
+                            tabs={tabSwitcherTabs}
+                            activeTab={activeTab.toString()}
+                            onTabChange={(tabKey) => setActiveTab(parseInt(tabKey))}
+                            variant="dialog"
+                        />
+                    </div>
+                )}
 
-                <div className="server-dialog-content">
+                <form className="server-dialog-content" onSubmit={(e) => e.preventDefault()} autoComplete="on">
                     {activeTab === 0 && <DetailsPage name={name} setName={setName}
                                                      icon={icon} setIcon={setIcon}
                                                      config={config} setConfig={setConfig}
@@ -346,12 +343,13 @@ export const ServerDialog = ({ open, onClose, currentFolderId, currentOrganizati
                     {activeTab === 1 && tabs[1]?.key === "identities" &&
                         <IdentityPage serverIdentities={identities} setIdentityUpdates={setIdentityUpdates}
                                       identityUpdates={identityUpdates} setIdentities={setIdentities}
-                                      currentOrganizationId={currentOrganizationId} allowedAuthTypes={fieldConfig.allowedAuthTypes} />}
+                                      currentOrganizationId={currentOrganizationId} allowedAuthTypes={fieldConfig.allowedAuthTypes}
+                                      serverName={name} />}
                     {tabs.find((tab, idx) => idx === activeTab && tab.key === "settings") && 
                         <SettingsPage config={config} setConfig={setConfig}
                                       monitoringEnabled={monitoringEnabled} setMonitoringEnabled={setMonitoringEnabled}
                                       fieldConfig={fieldConfig} editServerId={editServerId} />}
-                </div>
+                </form>
 
                 <Button className="server-dialog-button" onClick={handleSubmit}
                         text={editServerId ? t("servers.dialog.actions.save") : t("servers.dialog.actions.create")} />

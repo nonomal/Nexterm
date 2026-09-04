@@ -23,10 +23,6 @@ module.exports = db.define("accounts", {
         type: Sequelize.BOOLEAN,
         defaultValue: false,
     },
-    role: {
-        type: Sequelize.STRING,
-        defaultValue: "user",
-    },
     totpSecret: {
         type: Sequelize.STRING,
         defaultValue: () => {
@@ -37,4 +33,41 @@ module.exports = db.define("accounts", {
         type: Sequelize.STRING,
         defaultValue: "same_browser",
     },
-}, { freezeTableName: true, createdAt: false, updatedAt: false });
+    preferences: {
+        type: Sequelize.JSON,
+        defaultValue: {},
+    },
+    avatarHash: {
+        type: Sequelize.STRING,
+        allowNull: true,
+    },
+    activeThemeId: {
+        type: Sequelize.INTEGER,
+        allowNull: true,
+        references: { model: "themes", key: "id" },
+        onDelete: "SET NULL",
+    },
+}, { 
+    freezeTableName: true, 
+    createdAt: false, 
+    updatedAt: false,
+    hooks: {
+        afterFind: (accounts) => {
+            const parsePreferences = (account) => {
+                if (account && account.preferences && typeof account.preferences === 'string') {
+                    try {
+                        account.preferences = JSON.parse(account.preferences);
+                    } catch {
+                        account.preferences = {};
+                    }
+                }
+            };
+            
+            if (Array.isArray(accounts)) {
+                accounts.forEach(parsePreferences);
+            } else if (accounts) {
+                parsePreferences(accounts);
+            }
+        },
+    },
+});

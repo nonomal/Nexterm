@@ -1,111 +1,61 @@
-const net = require("net");
 const { updateAuditLogWithSessionDuration } = require("../controllers/audit");
 const SessionManager = require("../lib/SessionManager");
-const logger = require("../utils/logger");
+const { parseResizeMessage } = require("../utils/sshEventHandlers");
+const { translateKeys } = require("../utils/keyTranslation");
+const controlPlane = require("../lib/controlPlane/ControlPlaneServer");
+const { buildParticipant, createWriteGuard } = require("../utils/sessionParticipant");
 
-const createResizeBuffer = (width, height) => {
-    return Buffer.from([
-        255, 250, 31, // IAC SB NAWS
-        (width >> 8) & 0xFF, width & 0xFF,
-        (height >> 8) & 0xFF, height & 0xFF,
-        255, 240 // IAC SE
-    ]);
+const bindHandlers = (ws, conn, sessionId, config, isShared, canWrite) => {
+    const { dataSocket } = conn;
+
+    const msgHandler = (data) => {
+        if (isShared && !canWrite()) return;
+        const msg = data.toString();
+        const resize = parseResizeMessage(msg);
+        if (resize) {
+            if (SessionManager.isActiveWs(sessionId, ws)) {
+                controlPlane.sendSessionResize(conn.sessionId, resize.width, resize.height);
+                SessionManager.recordResize(sessionId, resize.width, resize.height);
+            }
+            return;
+        }
+        SessionManager.setActiveWs(sessionId, ws);
+        SessionManager.markTyping(sessionId, ws);
+        dataSocket.write(translateKeys(data, config));
+    };
+    ws.on("message", msgHandler);
+
+    const dataHandler = (data) => ws.readyState === ws.OPEN && ws.send(data.toString());
+    dataSocket.on("data", dataHandler);
+
+    return { msgHandler, dataHandler };
 };
 
-const setupSocketMessageHandler = (ws, socket) => {
-    ws.on("message", (data) => {
-        try {
-            data = data.toString();
+module.exports = async (ws, ctx) => {
+    const { serverSession, entry, isShared } = ctx;
+    if (!serverSession) return ws.close(4007, "Session required");
 
-            if (data.startsWith("\x01")) {
-                const resizeData = data.substring(1);
-                if (resizeData.includes(",")) {
-                    const [width, height] = resizeData.split(",").map(Number);
-                    if (!isNaN(width) && !isNaN(height)) {
-                        socket.write(createResizeBuffer(width, height));
-                        return;
-                    }
-                }
-                if (resizeData) {
-                    socket.write(resizeData);
-                }
-            } else {
-                socket.write(data);
-            }
-        } catch (error) {
-            logger.error(`Error sending message to telnet`, { error: error.message });
-        }
-    });
-};
+    const sessionId = serverSession.sessionId;
+    const conn = SessionManager.getConnection(sessionId);
 
-module.exports = async (ws, context) => {
-    const { entry, auditLogId, serverSession } = context;
-    const connectionStartTime = Date.now();
+    if (!conn?.dataSocket) return ws.close(4014, "Session not connected");
 
-    let existingConnection = null;
-    if (serverSession) existingConnection = SessionManager.getConnection(serverSession.sessionId);
+    const startTime = Date.now();
 
-    if (existingConnection) {
-        const socket = existingConnection.socket;
+    const logs = SessionManager.getLogBuffer(sessionId);
+    if (logs && ws.readyState === ws.OPEN) ws.send(logs);
 
-        const onData = (data) => {
-            if (ws.readyState === ws.OPEN) {
-                ws.send(data.toString());
-            }
-        };
-        socket.on("data", onData);
+    const canWrite = createWriteGuard(ctx, sessionId);
 
-        SessionManager.addWebSocket(serverSession.sessionId, ws);
-        setupSocketMessageHandler(ws, socket);
+    SessionManager.addWebSocket(sessionId, ws, isShared, buildParticipant(ctx));
+    if (!isShared || canWrite()) SessionManager.setActiveWs(sessionId, ws);
 
-        ws.on("close", () => {
-            socket.removeListener("data", onData);
-            SessionManager.removeWebSocket(serverSession.sessionId, ws);
-        });
-
-        return;
-    }
-
-    const socket = new net.Socket();
-    let connectionEstablished = false;
-
-    socket.connect(entry.config.port || 23, entry.config.ip, () => {
-        connectionEstablished = true;
-        logger.info(`Telnet connection established`, { ip: entry.config.ip, port: entry.config.port || 23, entryId: entry.id });
-
-        if (serverSession) {
-            SessionManager.setConnection(serverSession.sessionId, { socket, auditLogId });
-            SessionManager.addWebSocket(serverSession.sessionId, ws);
-        }
-    });
-
-    socket.on("data", (data) => {
-        if (ws.readyState === ws.OPEN) {
-            ws.send(data.toString());
-        }
-    });
-
-    socket.on("close", async () => {
-        await updateAuditLogWithSessionDuration(auditLogId, connectionStartTime);
-        if (ws.readyState === ws.OPEN) {
-            ws.close();
-        }
-        if (serverSession) SessionManager.remove(serverSession.sessionId);
-    });
-
-    socket.on("error", async (error) => {
-        logger.error(`Telnet connection error`, { error: error.message, ip: entry.config.ip, port: entry.config.port || 23 });
-        await updateAuditLogWithSessionDuration(auditLogId, connectionStartTime);
-        if (ws.readyState === ws.OPEN) {
-            ws.close(1011, error.message);
-        }
-        if (serverSession) SessionManager.remove(serverSession.sessionId);
-    });
-
-    setupSocketMessageHandler(ws, socket);
+    const { msgHandler, dataHandler } = bindHandlers(ws, conn, sessionId, entry?.config, isShared, canWrite);
 
     ws.on("close", async () => {
-        if (serverSession) SessionManager.removeWebSocket(serverSession.sessionId, ws);
-        await updateAuditLogWithSessionDuration(auditLogId, connectionStartTime);
+        conn.dataSocket.removeListener("data", dataHandler);
+        ws.removeListener("message", msgHandler);
+        SessionManager.removeWebSocket(sessionId, ws, isShared);
+        if (!isShared) await updateAuditLogWithSessionDuration(conn.auditLogId, startTime);
     });
 };

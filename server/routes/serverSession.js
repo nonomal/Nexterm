@@ -1,7 +1,9 @@
 const { Router } = require("express");
-const { createSession, getSessions, getSession, hibernateSession, resumeSession, deleteSession, startSharing, stopSharing, updateSharePermissions, duplicateSession } = require("../controllers/serverSession");
+const { createSession, getSessions, getSession, hibernateSession, resumeSession, deleteSession, startSharing, stopSharing, updateSharePermissions, duplicateSession, pasteIdentityPassword } = require("../controllers/serverSession");
+const { execCommand } = require("../controllers/execCommand");
 const { createSessionValidation, sessionIdValidation, resumeSessionValidation, duplicateSessionValidation } = require("../validations/serverSession");
 const { validateSchema } = require("../utils/schema");
+const stateBroadcaster = require("../lib/StateBroadcaster");
 
 const app = Router();
 
@@ -19,15 +21,15 @@ app.post("/", async (req, res) => {
     if (validateSchema(res, createSessionValidation, req.body)) return;
     
     try {
-        const { entryId, identityId, connectionReason, type, directIdentity, tabId, browserId, scriptId } = req.body;
+        const { entryId, identityId, connectionReason, type, directIdentity, tabId, browserId, scriptId, startPath } = req.body;
         const ipAddress = req.ip || req.socket?.remoteAddress || 'unknown';
         const userAgent = req.headers['user-agent'] || 'unknown';
-        const result = await createSession(req.user.id, entryId, identityId, connectionReason, type, directIdentity, tabId, browserId, scriptId, ipAddress, userAgent);
+        const result = await createSession(req.user.id, entryId, identityId, connectionReason, type, directIdentity, tabId, browserId, scriptId, startPath, ipAddress, userAgent);
         
         if (result?.code) {
             return res.status(result.code).json({ error: result.message });
         }
-        
+
         res.status(201).json(result);
     } catch (error) {
         console.error('Error creating session:', error);
@@ -86,6 +88,7 @@ app.post("/:id/hibernate", async (req, res) => {
     if (result?.code) {
         return res.status(result.code).json({ error: result.message });
     }
+    stateBroadcaster.broadcast("CONNECTIONS", { accountId: req.user.id });
     res.json(result);
 });
 
@@ -108,6 +111,7 @@ app.post("/:id/resume", async (req, res) => {
     if (result?.code) {
         return res.status(result.code).json({ error: result.message });
     }
+    stateBroadcaster.broadcast("CONNECTIONS", { accountId: req.user.id });
     res.json(result);
 });
 
@@ -128,6 +132,7 @@ app.delete("/:id", async (req, res) => {
     if (result?.code) {
         return res.status(result.code).json({ error: result.message });
     }
+    stateBroadcaster.broadcast("CONNECTIONS", { accountId: req.user.id });
     res.json(result);
 });
 
@@ -145,6 +150,7 @@ app.post("/:id/share", (req, res) => {
     if (validateSchema(res, sessionIdValidation, req.params)) return;
     const result = startSharing(req.user.id, req.params.id, req.body?.writable === true);
     if (result?.code) return res.status(result.code).json({ error: result.message });
+    stateBroadcaster.broadcast("CONNECTIONS", { accountId: req.user.id });
     res.json(result);
 });
 
@@ -162,6 +168,7 @@ app.delete("/:id/share", (req, res) => {
     if (validateSchema(res, sessionIdValidation, req.params)) return;
     const result = stopSharing(req.user.id, req.params.id);
     if (result?.code) return res.status(result.code).json({ error: result.message });
+    stateBroadcaster.broadcast("CONNECTIONS", { accountId: req.user.id });
     res.json(result);
 });
 
@@ -179,6 +186,7 @@ app.patch("/:id/share", (req, res) => {
     if (validateSchema(res, sessionIdValidation, req.params)) return;
     const result = updateSharePermissions(req.user.id, req.params.id, req.body?.writable === true);
     if (result?.code) return res.status(result.code).json({ error: result.message });
+    stateBroadcaster.broadcast("CONNECTIONS", { accountId: req.user.id });
     res.json(result);
 });
 
@@ -204,7 +212,71 @@ app.post("/:id/duplicate", async (req, res) => {
     if (result?.code) {
         return res.status(result.code).json({ error: result.message });
     }
+    stateBroadcaster.broadcast("CONNECTIONS", { accountId: req.user.id });
     res.status(201).json(result);
+});
+
+/**
+ * POST /connections/{id}/paste-password
+ * @summary Paste identity password into session
+ * @description Inserts the password of an identity attached to the session's server into the active session stream. Defaults to the session's identity; an optional identityId in the body selects another identity attached to the same server.
+ * @tags Connection
+ * @produces application/json
+ * @security BearerAuth
+ * @param {string} id.path.required - Session ID
+ */
+app.post("/:id/paste-password", async (req, res) => {
+    if (validateSchema(res, sessionIdValidation, req.params)) return;
+
+    let identityId = null;
+    if (req.body?.identityId !== undefined && req.body?.identityId !== null) {
+        identityId = Number.parseInt(req.body.identityId, 10);
+        if (Number.isNaN(identityId)) return res.status(400).json({ error: "Invalid identity ID" });
+    }
+
+    try {
+        const result = await pasteIdentityPassword(req.user.id, req.params.id, req.ip, req.headers?.["user-agent"], identityId);
+        if (result?.code) return res.status(result.code).json({ error: result.message });
+        res.json(result);
+    } catch (error) {
+        console.error('Error pasting identity password:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+/**
+ * POST /connections/{entryId}/exec
+ * @summary Execute Command
+ * @description Executes a single command on a server entry and returns the output.
+ * @tags Connection
+ * @produces application/json
+ * @security BearerAuth
+ * @param {number} entryId.path.required - Entry ID
+ * @param {object} request.body.required - Command to execute
+ * @return {object} 200 - Command result with stdout, stderr, exitCode
+ */
+app.post("/:entryId/exec", async (req, res) => {
+    try {
+        const entryId = parseInt(req.params.entryId, 10);
+        if (isNaN(entryId)) return res.status(400).json({ error: "Invalid entry ID" });
+
+        const { command } = req.body;
+        if (!command || typeof command !== "string") {
+            return res.status(400).json({ error: "Command is required" });
+        }
+
+        const identityId = req.query.identityId ? parseInt(req.query.identityId, 10) : null;
+        const result = await execCommand(req.user.id, entryId, identityId, command);
+
+        if (result?.code) {
+            return res.status(result.code).json({ error: result.message });
+        }
+
+        res.json(result);
+    } catch (error) {
+        console.error('Error executing command:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
 });
 
 module.exports = app;

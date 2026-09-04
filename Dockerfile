@@ -1,84 +1,35 @@
-FROM node:22-alpine AS client-builder
+ARG SERVER_IMAGE=nexterm/server:latest
+ARG ENGINE_IMAGE=nexterm/engine:latest
 
-WORKDIR /app
-
-COPY vendor/guacamole-client/guacamole-common-js/ ./vendor/guacamole-client/guacamole-common-js/
-
-WORKDIR /app/client
-
-COPY client/package.json client/yarn.lock ./
-RUN yarn install --frozen-lockfile --network-timeout 100000
-
-COPY client/ .
-RUN yarn build
-
-FROM node:22-alpine AS server-builder
-
-WORKDIR /app
-
-RUN apk add --no-cache \
-    python3 py3-pip py3-setuptools \
-    make g++ gcc build-base
-
-COPY package.json yarn.lock ./
-RUN yarn install --production --frozen-lockfile --network-timeout 100000
-
-COPY server/ server/
-
-FROM node:22-alpine AS guacd-builder
-
-RUN apk add --no-cache \
-    cairo-dev jpeg-dev libpng-dev ossp-uuid-dev \
-    pango-dev libvncserver-dev libwebp-dev openssl-dev freerdp2-dev \
-    pulseaudio-dev libvorbis-dev libogg-dev libssh2-dev \
-    ffmpeg-dev \
-    build-base autoconf automake libtool
-
-WORKDIR /build
-
-COPY vendor/guacamole-server/ ./guacamole-server/
-
-RUN cd guacamole-server \
-    && autoreconf -fi \
-    && ./configure --with-init-dir=/etc/init.d --prefix=/usr/local --disable-guacenc --disable-guaclog \
-    && make -j$(nproc) \
-    && make DESTDIR=/install install \
-    && rm -rf /install/usr/local/include \
-    && rm -f /install/usr/local/lib/*.a \
-    && rm -f /install/usr/local/lib/*.la \
-    && rm -f /install/usr/local/*.md /install/usr/local/LICENSE \
-    && strip /install/usr/local/sbin/guacd /install/usr/local/lib/*.so.* 2>/dev/null || true
-
-FROM node:22-alpine
+FROM ${ENGINE_IMAGE} AS engine
+FROM ${SERVER_IMAGE}
 
 RUN apk add --no-cache \
     cairo jpeg libpng ossp-uuid \
-    pango libvncserver libwebp openssl freerdp2-libs \
-    pulseaudio libvorbis libogg libssh2 \
-    ffmpeg-libavcodec ffmpeg-libavformat ffmpeg-libavutil ffmpeg-libswscale \
-    util-linux
+    pango libwebp openssl \
+    libpulse libvorbis libogg libssh2 \
+    libvncserver freerdp-libs libcurl \
+    util-linux samba-client
 
-COPY --from=guacd-builder /install/usr/local/sbin/ /usr/local/sbin/
-COPY --from=guacd-builder /install/usr/local/lib/ /usr/local/lib/
-COPY --from=guacd-builder /install/usr/lib/freerdp2/ /usr/lib/freerdp2/
+COPY scripts/install-browser-runtime.sh /tmp/install-browser-runtime.sh
+RUN sh /tmp/install-browser-runtime.sh && rm -f /tmp/install-browser-runtime.sh
 
-RUN ldconfig /usr/local/lib 2>/dev/null || true
+COPY --from=engine /usr/lib/dri/ /usr/lib/dri/
+COPY --from=engine /usr/lib/gbm/ /usr/lib/gbm/
+COPY --from=engine /usr/lib/libEGL.so* /usr/lib/libGL.so* /usr/lib/libGLESv2.so* \
+     /usr/lib/libgbm.so* /usr/lib/libgallium-*.so /usr/lib/
 
-ENV NODE_ENV=production
-ENV LOG_LEVEL=system
+COPY --from=engine /usr/lib/libvncclient.so.1 /usr/lib/
 
-WORKDIR /app
+COPY --from=engine /usr/local/lib/ /usr/local/lib/
 
-COPY --from=client-builder /app/client/dist ./dist
+COPY --from=engine /usr/local/bin/nexterm-engine /usr/local/bin/nexterm-engine
 
-COPY --from=server-builder /app/server ./server
-COPY --from=server-builder /app/node_modules ./node_modules
-COPY --from=server-builder /app/package.json ./
-COPY --from=server-builder /app/yarn.lock ./
+COPY --from=engine /usr/local/bin/nexterm-webview /usr/local/bin/nexterm-webview
 
-COPY docker-start.sh .
+COPY --from=engine /usr/local/lib/freerdp3/ /usr/lib/freerdp3/
 
-RUN chmod +x docker-start.sh
+RUN ldconfig /usr/lib /usr/local/lib 2>/dev/null || true
 
 EXPOSE 6989
 

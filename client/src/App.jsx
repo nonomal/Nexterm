@@ -10,19 +10,20 @@ import Root from "@/common/layouts/Root.jsx";
 import PopoutRoot from "@/common/layouts/PopoutRoot.jsx";
 import ShareRoot from "@/common/layouts/ShareRoot.jsx";
 import TunnelRoot from "@/common/layouts/TunnelRoot.jsx";
+import LinkRoot from "@/common/layouts/LinkRoot.jsx";
 import i18n from "./i18n.js";
 import Loading from "@/common/components/Loading";
 import { RouteErrorPage } from "@/common/components/ErrorBoundary";
 import TitleBar from "@/common/components/TitleBar";
 
 const Servers = lazy(() => import("@/pages/Servers"));
-const Settings = lazy(() => import("@/pages/Settings"));
 const Snippets = lazy(() => import("@/pages/Snippets"));
 const Monitoring = lazy(() => import("@/pages/Monitoring"));
 const Audit = lazy(() => import("@/pages/Audit"));
 const Popout = lazy(() => import("@/pages/Popout"));
 const Share = lazy(() => import("@/pages/Share"));
 const Tunnel = lazy(() => import("@/pages/Tunnel"));
+const Link = lazy(() => import("@/pages/Link"));
 
 export const GITHUB_URL = "https://github.com/gnmyt/Nexterm";
 export const DISCORD_URL = "https://dc.gnm.dev/";
@@ -53,8 +54,15 @@ const App = () => {
                 { path: "/monitoring/:serverId", element: <Monitoring /> },
                 { path: "/monitoring/:serverId/:tab", element: <Monitoring /> },
                 { path: "/audit", element: <Audit /> },
-                { path: "/settings/*", element: <Settings/> },
                 { path: "/snippets", element: <Snippets /> }
+            ],
+        },
+        {
+            path: "/link",
+            element: <LinkRoot />,
+            errorElement: <RouteErrorPage />,
+            children: [
+                { path: "/link", element: <Link /> }
             ],
         },
         {
@@ -62,7 +70,8 @@ const App = () => {
             element: <PopoutRoot />,
             errorElement: <RouteErrorPage />,
             children: [
-                { path: "/popout/:sessionId", element: <Popout /> }
+                { path: "/popout/:sessionId", element: <Popout /> },
+                { path: "/popout/:sessionId/:monitor", element: <Popout /> }
             ],
         },
         {

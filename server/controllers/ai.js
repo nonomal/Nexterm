@@ -1,342 +1,152 @@
 const AISettings = require("../models/AISettings");
-const MonitoringSnapshot = require("../models/MonitoringSnapshot");
 const logger = require("../utils/logger");
+const { getProvider, describeProviders, getProviderOAuth, isSubscriptionConnected } = require("../lib/ai/providers");
+const { generateCommand } = require("../lib/ai/commandGen");
+const SessionManager = require("../lib/SessionManager");
+const Entry = require("../models/Entry");
 
-const SYSTEM_PROMPT = process.env.AI_SYSTEM_PROMPT || `You are a Linux command generator assistant. Your job is to generate appropriate Linux/Unix shell commands based on user requests.
-
-Rules:
-1. Return ONLY the command(s), no explanations or markdown formatting
-2. If multiple commands are needed, separate them with && or ;
-3. Prefer safe, commonly available commands
-4. If the request is unclear, provide the most likely intended command
-5. For dangerous operations, use safer alternatives when possible
-6. Always assume the user wants commands for a modern Linux system
-
-Examples:
-User: "list all files"
-Response: ls -la
-
-User: "find large files"
-Response: find . -type f -size +100M -exec ls -lh {} + | sort -k5 -hr
-
-User: "check memory usage"
-Response: free -h && top -o %MEM -n 1`;
-
-const buildSystemPrompt = (osInfo, recentOutput) => {
-    let prompt = SYSTEM_PROMPT;
-    
-    if (osInfo) {
-        const osParts = [];
-        if (osInfo.hostname) osParts.push(`hostname: ${osInfo.hostname}`);
-        if (osInfo.kernel) osParts.push(`kernel: ${osInfo.kernel}`);
-        if (osInfo.name) osParts.push(`distro: ${osInfo.name}`);
-        if (osInfo.version) osParts.push(`release: ${osInfo.version}`);
-        if (osParts.length) {
-            prompt += `\n\nServer info: ${osParts.join(', ')}`;
-        }
-    }
-    
-    if (recentOutput) {
-        prompt += `\n\nRecent terminal output:\n${recentOutput}`;
-    }
-    
-    return prompt;
+const isConfigured = (settings) => {
+    if (!settings?.enabled || !settings.provider || !settings.model) return false;
+    const provider = getProvider(settings.provider);
+    if (!provider) return false;
+    return provider.validate(settings) === null;
 };
 
-module.exports.getAISettings = async () => {
-    let settings = await AISettings.findOne();
+const sanitizeSettingsResponse = (settings) => ({
+    id: settings.id,
+    enabled: Boolean(settings.enabled),
+    provider: settings.provider,
+    model: settings.model,
+    apiUrl: settings.apiUrl,
+    authMethod: settings.authMethod,
+    requireConfirmation: Boolean(settings.requireConfirmation),
+    isConfigured: isConfigured(settings),
+    hasApiKey: Boolean(settings.apiKey),
+    subscriptionConnected: isSubscriptionConnected(settings),
+    subscriptionProvider: settings.oauthRefreshToken ? settings.oauthProvider : null,
+});
 
-    if (!settings) settings = await AISettings.create({});
-    const response = settings.dataValues ? { ...settings.dataValues } : { ...settings };
-
-    response.enabled = Boolean(response.enabled);
-
-    if (response.apiKey) {
-        response.hasApiKey = true;
-        delete response.apiKey;
+const resolveOAuthClient = async (providerId) => {
+    let id = providerId;
+    if (!id) {
+        const settings = await AISettings.findOne();
+        id = settings?.provider;
     }
+    if (!id) return { error: { code: 400, message: "No AI provider selected" } };
+    const oauth = getProviderOAuth(id);
+    if (!oauth) return { error: { code: 400, message: "Selected provider does not support subscription login" } };
+    return { oauth };
+};
 
-    return response;
+module.exports.getRuntimeSettings = async () => AISettings.findOne();
+
+module.exports.isConfigured = isConfigured;
+
+module.exports.getProviders = () => ({ providers: describeProviders() });
+
+module.exports.getAISettings = async () => {
+    const settings = await AISettings.getOrCreate();
+    return sanitizeSettingsResponse(settings);
 };
 
 module.exports.updateAISettings = async (updateData) => {
-    const { enabled, provider, model, apiKey, apiUrl } = updateData;
+    const { enabled, provider, model, apiKey, apiUrl, authMethod, requireConfirmation } = updateData;
+    const settings = await AISettings.getOrCreate();
 
-    let settings = await AISettings.findOne();
+    const payload = {};
+    if (enabled !== undefined) payload.enabled = enabled;
+    if (provider !== undefined) payload.provider = provider;
+    if (model !== undefined) payload.model = model;
+    if (apiUrl !== undefined) payload.apiUrl = apiUrl;
+    if (authMethod !== undefined) payload.authMethod = authMethod;
+    if (requireConfirmation !== undefined) payload.requireConfirmation = requireConfirmation;
+    if (apiKey !== undefined) payload.apiKey = apiKey === "" ? null : apiKey;
 
-    if (!settings) settings = await AISettings.create({});
+    await AISettings.update(AISettings.encryptSecrets(payload), { where: { id: settings.id } });
 
-    const updatePayload = {};
-    if (enabled !== undefined) updatePayload.enabled = enabled;
-    if (provider !== undefined) updatePayload.provider = provider;
-    if (model !== undefined) updatePayload.model = model;
-    if (apiUrl !== undefined) updatePayload.apiUrl = apiUrl;
+    return sanitizeSettingsResponse(await AISettings.findOne());
+};
 
-    if (apiKey !== undefined) {
-        updatePayload.apiKey = apiKey === "" ? null : apiKey;
-    }
+module.exports.startOAuth = async (providerId) => {
+    const { oauth, error } = await resolveOAuthClient(providerId);
+    if (error) return error;
+    return { authUrl: await oauth.generateAuthUrl() };
+};
 
-    const settingsId = settings.dataValues ? settings.dataValues.id : settings.id;
-    await AISettings.update(updatePayload, { where: { id: settingsId } });
+module.exports.exchangeOAuth = async (code, providerId) => {
+    const { oauth, error } = await resolveOAuthClient(providerId);
+    if (error) return error;
+    return oauth.exchangeCode(code);
+};
 
-    const updatedSettings = await AISettings.findOne();
+module.exports.disconnectOAuth = async (providerId) => {
+    const { oauth, error } = await resolveOAuthClient(providerId);
+    if (error) return error;
+    return oauth.disconnect();
+};
 
-    const response = updatedSettings.dataValues ? { ...updatedSettings.dataValues } : { ...updatedSettings };
-
-    response.enabled = Boolean(response.enabled);
-
-    if (response.apiKey) {
-        response.hasApiKey = true;
-        delete response.apiKey;
-    }
-
-    return response;
+const resolveConfiguredProvider = (settings, { requireEnabled = true } = {}) => {
+    if (!settings) return { error: { code: 400, message: "No AI provider configured" } };
+    if (requireEnabled && !settings.enabled) return { error: { code: 400, message: "AI is not enabled" } };
+    if (!settings.provider) return { error: { code: 400, message: "No AI provider configured" } };
+    const provider = getProvider(settings.provider);
+    if (!provider) return { error: { code: 400, message: "Unsupported provider" } };
+    const validationError = provider.validate(settings);
+    if (validationError) return { error: { code: 400, message: validationError } };
+    return { provider };
 };
 
 module.exports.testAIConnection = async () => {
     const settings = await AISettings.findOne();
+    if (!settings?.model) return { code: 400, message: "No AI model configured" };
 
-    if (!settings || !settings.enabled) return { code: 400, message: "AI is not enabled" };
-    if (!settings.provider) return { code: 400, message: "No AI provider configured" };
-    if (!settings.model) return { code: 400, message: "No AI model configured" };
+    const { provider, error } = resolveConfiguredProvider(settings);
+    if (error) return error;
 
     try {
-        if (settings.provider === "openai") {
-            if (!settings.apiKey) return { code: 400, message: "OpenAI API key not configured" };
+        const models = await provider.listModels(settings);
+        if (models.error) return models.error;
 
-            const response = await fetch("https://api.openai.com/v1/models", {
-                headers: {
-                    "Authorization": `Bearer ${settings.apiKey}`,
-                    "Content-Type": "application/json",
-                },
-            });
-
-            if (!response.ok) return { code: 500, message: `OpenAI API error: ${response.status}` };
-
-            const data = await response.json();
-            const modelExists = data.data.some(model => model.id === settings.model);
-
-            if (!modelExists) return {
-                code: 400,
-                message: `Configured model "${settings.model}" not found in your OpenAI account`,
-            };
-        } else if (settings.provider === "ollama") {
-            let ollamaUrl = settings.apiUrl || "http://localhost:11434";
-            ollamaUrl = ollamaUrl.replace(/\/+$/, "");
-
-            const response = await fetch(`${ollamaUrl}/api/tags`, {
-                method: "GET",
-                headers: {
-                    "Content-Type": "application/json",
-                },
-            });
-
-            if (!response.ok) return { code: 500, message: `Ollama API error: ${response.status}` };
-
-            const data = await response.json();
-            const models = data.models ? data.models.map(model => model.name) : [];
-
-            if (!models.includes(settings.model)) return {
-                code: 400,
-                message: `Configured model "${settings.model}" not found in Ollama`,
-            };
+        if (!models.list.includes(settings.model)) {
+            return { code: 400, message: `Configured model "${settings.model}" not found in ${provider.label}` };
         }
 
         return { success: true, message: "Connection test successful" };
     } catch (error) {
-        logger.error("AI connection test failed", { error: error.message, stack: error.stack });
+        logger.error("AI connection test failed", { error: error.message });
         return { code: 500, message: `Connection test failed: ${error.message}` };
     }
 };
 
 module.exports.getAvailableModels = async () => {
     const settings = await AISettings.findOne();
+    const { provider, error } = resolveConfiguredProvider(settings, { requireEnabled: false });
+    if (error) return error;
 
-    if (!settings || !settings.provider) return { code: 400, message: "No AI provider configured" };
-
-    if (settings.provider === "ollama") {
-        try {
-            let ollamaUrl = settings.apiUrl || "http://localhost:11434";
-            ollamaUrl = ollamaUrl.replace(/\/+$/, "");
-
-            const response = await fetch(`${ollamaUrl}/api/tags`, {
-                method: "GET",
-                headers: {
-                    "Content-Type": "application/json",
-                },
-            });
-
-            if (!response.ok) return { code: 500, message: "Failed to fetch models from Ollama" };
-
-            const data = await response.json();
-            const ollamaModels = data.models ? data.models.map(model => model.name).filter(name => name) : [];
-
-            return { models: ollamaModels || [] };
-        } catch (error) {
-            return { models: [] };
-        }
-    } else if (settings.provider === "openai") {
-        if (!settings.apiKey) return { code: 400, message: "OpenAI API key not configured" };
-
-        try {
-            const response = await fetch("https://api.openai.com/v1/models", {
-                headers: {
-                    "Authorization": `Bearer ${settings.apiKey}`,
-                    "Content-Type": "application/json",
-                },
-            });
-
-            if (!response.ok) return { code: 500, message: "Failed to fetch models from OpenAI" };
-
-            const data = await response.json();
-
-            const chatModels = data.data
-                .filter(model =>
-                    model.id.includes("gpt") &&
-                    !model.id.includes("instruct") &&
-                    !model.id.includes("edit") &&
-                    !model.id.includes("embedding") &&
-                    !model.id.includes("whisper") &&
-                    !model.id.includes("tts") &&
-                    !model.id.includes("dall-e"),
-                )
-                .map(model => model.id)
-                .sort();
-
-            return { models: chatModels || [] };
-        } catch (error) {
-            logger.error("Error fetching OpenAI models", { error: error.message });
-            return { models: [] };
-        }
-    } else {
-        return { code: 400, message: "Unsupported provider" };
+    try {
+        const result = await provider.listModels(settings);
+        if (result.error) return result.error;
+        return { models: result.list };
+    } catch (error) {
+        logger.error(`Error fetching models for ${settings.provider}`, { error: error.message });
+        return { models: [] };
     }
 };
 
-module.exports.generateCommand = async (prompt, entryId, recentOutput) => {
+module.exports.generateSessionCommand = async (accountId, { sessionId, prompt, shell, rejected }) => {
     const settings = await AISettings.findOne();
+    if (!isConfigured(settings)) return { code: 400, message: "AI assistant is not configured" };
 
-    if (!settings || !settings.enabled) return { code: 400, message: "AI is not enabled" };
-    if (!settings.provider || !settings.model) return { code: 400, message: "AI not properly configured" };
+    const session = SessionManager.get(sessionId);
+    if (!session) return { code: 404, message: "Session not found" };
+    if (session.accountId !== accountId) return { code: 403, message: "Access denied" };
 
-    let osInfo = null;
-    
-    if (entryId) {
-        try {
-            const snapshot = await MonitoringSnapshot.findOne({ where: { entryId } });
-            if (snapshot && snapshot.osInfo) {
-                osInfo = snapshot.osInfo;
-            }
-        } catch (error) {
-            logger.error("Failed to fetch monitoring snapshot for AI", { entryId, error: error.message });
-        }
+    const entry = await Entry.findByPk(session.entryId);
+
+    try {
+        return await generateCommand({ settings, entry, prompt, shell, rejected });
+    } catch (error) {
+        logger.error("AI command generation failed", { error: error.message });
+        return { code: 500, message: `Command generation failed: ${error.message}` };
     }
-
-    const systemPrompt = buildSystemPrompt(osInfo, recentOutput);
-
-    let command;
-    if (settings.provider === "openai") {
-        command = await generateOpenAICommand(prompt, settings, systemPrompt);
-    } else if (settings.provider === "ollama") {
-        command = await generateOllamaCommand(prompt, settings, systemPrompt);
-    } else {
-        return { code: 400, message: "Unsupported AI provider" };
-    }
-
-    return { command };
-};
-
-const generateOpenAICommand = async (prompt, settings, systemPrompt) => {
-    if (!settings.apiKey) throw new Error("OpenAI API key not configured");
-
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
-        method: "POST",
-        headers: {
-            "Authorization": `Bearer ${settings.apiKey}`,
-            "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-            model: settings.model,
-            messages: [
-                { role: "system", content: systemPrompt },
-                { role: "user", content: prompt },
-            ],
-            max_tokens: 150,
-            temperature: 0.3,
-            stop: ["\n\n"],
-        }),
-    });
-
-    if (!response.ok) {
-        const error = await response.json();
-        throw new Error(`OpenAI API error: ${error.error?.message || response.status}`);
-    }
-
-    const data = await response.json();
-    const rawContent = data.choices[0]?.message?.content?.trim() || "echo 'No command generated'";
-    return parseAIResponse(rawContent);
-};
-
-const generateOllamaCommand = async (prompt, settings, systemPrompt) => {
-    let ollamaUrl = settings.apiUrl || "http://localhost:11434";
-    ollamaUrl = ollamaUrl.replace(/\/+$/, "");
-
-    const response = await fetch(`${ollamaUrl}/api/chat`, {
-        method: "POST",
-        headers: {
-            "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-            model: settings.model,
-            messages: [
-                { role: "system", content: systemPrompt },
-                { role: "user", content: prompt },
-            ],
-            stream: false,
-            options: {
-                temperature: 0.3,
-                num_predict: 150,
-                stop: ["\n\n"],
-            },
-        }),
-    });
-
-    if (!response.ok) throw new Error(`Ollama API error: ${response.status}`);
-
-    const data = await response.json();
-    const rawContent = data.message?.content?.trim() || "echo 'No command generated'";
-    return parseAIResponse(rawContent);
-};
-
-const parseAIResponse = (response) => {
-    if (!response) return "echo 'No command generated'";
-
-    let cleanResponse = response.replace(/```(?:bash|sh|shell)?\n?/g, "").replace(/```/g, "");
-
-    const responseMatch = cleanResponse.match(/Response:\s*(.+?)(?:\n|$)/i);
-    if (responseMatch) return responseMatch[1].trim().replace(/[\r\n]+$/, "");
-
-    if (cleanResponse.toLowerCase().startsWith("user:")) {
-        const userMatch = cleanResponse.match(/User:\s*["']?(.+?)["']?(?:\s*Response:|$)/i);
-        if (userMatch) return "echo 'Command not properly generated'";
-    }
-
-    const lines = cleanResponse.split("\n").map(line => line.trim()).filter(line => line);
-
-    if (lines.length > 1) {
-        const commandLine = lines.find(line =>
-            !line.toLowerCase().startsWith("user:") &&
-            !line.toLowerCase().startsWith("response:") &&
-            line.length > 0,
-        );
-
-        if (commandLine) return commandLine.trim().replace(/[\r\n]+$/, "");
-    }
-
-    if (cleanResponse.toLowerCase().startsWith("user:") ||
-        cleanResponse.toLowerCase().startsWith("response:")) {
-        return "echo 'Command not properly generated'";
-    }
-
-    return cleanResponse.trim().replace(/[\r\n]+$/, "") || "echo 'No command generated'";
 };

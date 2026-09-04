@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import Icon from "@mdi/react";
-import { mdiChevronRight } from "@mdi/js";
+import { mdiChevronRight, mdiChevronDown, mdiCheck } from "@mdi/js";
 
 export const ContextMenuItem = ({
     icon,
@@ -11,13 +11,22 @@ export const ContextMenuItem = ({
     children,
     customContent = null,
     danger = false,
+    checked = false,
 }) => {
     const [isSubmenuOpen, setIsSubmenuOpen] = useState(false);
     const itemRef = useRef(null);
     const submenuRef = useRef(null);
     const [submenuPosition, setSubmenuPosition] = useState({ left: "100%", top: 0 });
+    const [isMobile, setIsMobile] = useState(false);
 
     const hasSubmenu = children && React.Children.count(children) > 0;
+
+    useEffect(() => {
+        const checkMobile = () => setIsMobile(window.innerWidth <= 768);
+        checkMobile();
+        window.addEventListener('resize', checkMobile);
+        return () => window.removeEventListener('resize', checkMobile);
+    }, []);
 
     useEffect(() => {
         if (!isSubmenuOpen || !submenuRef.current) return;
@@ -28,10 +37,24 @@ export const ContextMenuItem = ({
             const submenuRect = submenuRef.current.getBoundingClientRect();
             const { innerWidth, innerHeight } = window;
 
-            setSubmenuPosition({
-                left: itemRect.right + submenuRect.width > innerWidth ? `-${submenuRect.width}px` : "100%",
-                top: itemRect.top + submenuRect.height > innerHeight ? -(submenuRect.height - itemRect.height) : 0
-            });
+            if (isMobile) return setSubmenuPosition({ left: 0, top: "100%", position: "relative", width: "100%" });
+
+            let left = "100%";
+            if (itemRect.right + submenuRect.width > innerWidth) {
+                if (itemRect.left - submenuRect.width >= 0) {
+                    left = `-${submenuRect.width}px`;
+                } else {
+                    const availableRight = innerWidth - itemRect.right - 10;
+                    const availableLeft = itemRect.left - 10;
+                    left = availableLeft > availableRight ? `-${Math.min(submenuRect.width, availableLeft)}px` : "100%";
+                }
+            }
+
+            const top = itemRect.top + submenuRect.height > innerHeight
+                ? Math.max(-(submenuRect.height - itemRect.height), -(itemRect.top - 10))
+                : 0;
+
+            setSubmenuPosition({ left, top });
         };
 
         const timer = setTimeout(() => requestAnimationFrame(() => requestAnimationFrame(updatePosition)), 0);
@@ -54,7 +77,7 @@ export const ContextMenuItem = ({
             observer.disconnect();
             window.removeEventListener('resize', updatePosition);
         };
-    }, [isSubmenuOpen]);
+    }, [isSubmenuOpen, isMobile]);
 
     const handleClick = (e) => {
         e.stopPropagation();
@@ -114,11 +137,11 @@ export const ContextMenuItem = ({
     return (
         <div
             ref={itemRef}
-            className={`context-menu-item ${disabled ? "disabled" : ""} ${danger ? "danger" : ""} ${hasSubmenu ? "has-submenu" : ""}`}
+            className={`context-menu-item ${disabled ? "disabled" : ""} ${danger ? "danger" : ""} ${hasSubmenu ? "has-submenu" : ""} ${isSubmenuOpen && isMobile ? "submenu-open-mobile" : ""}`}
             onClick={handleClick}
             onKeyDown={handleKeyDown}
-            onMouseEnter={handleMouseEnter}
-            onMouseLeave={handleMouseLeave}
+            onMouseEnter={!isMobile ? handleMouseEnter : undefined}
+            onMouseLeave={!isMobile ? handleMouseLeave : undefined}
             role="menuitem"
             tabIndex={disabled ? -1 : 0}
             aria-disabled={disabled}
@@ -127,13 +150,15 @@ export const ContextMenuItem = ({
         >
             {icon && (typeof icon === "string" ? <Icon path={icon} className="menu-icon" /> : <span className="menu-icon">{icon}</span>)}
             <span className="menu-label">{label}</span>
+            {checked && !hasSubmenu && <Icon path={mdiCheck} className="menu-check" />}
             {hasSubmenu && (
                 <>
-                    <Icon path={mdiChevronRight} className="submenu-arrow" />
+                    <Icon path={isMobile ? mdiChevronDown : mdiChevronRight} className={`submenu-arrow ${isSubmenuOpen ? "open" : ""}`} />
                     {isSubmenuOpen && (
-                        <div ref={submenuRef} className="context-menu-submenu"
-                             style={submenuPosition} role="menu" aria-orientation="vertical"
-                             onKeyDown={handleSubmenuKeyDown}>
+                        <div ref={submenuRef} className={`context-menu-submenu ${isMobile ? "mobile" : ""}`}
+                             style={!isMobile ? submenuPosition : undefined} role="menu" aria-orientation="vertical"
+                             onKeyDown={handleSubmenuKeyDown}
+                             onClick={(e) => e.stopPropagation()}>
                             {React.Children.map(children, (child) => {
                                 if (!React.isValidElement(child)) return child;
                                 if (child.type === React.Fragment || typeof child.type === 'string') return child;

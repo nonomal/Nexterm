@@ -1,20 +1,28 @@
 import Icon from "@mdi/react";
 import { mdiSleep } from "@mdi/js";
+import { getIconPath } from "@/common/utils/iconUtils.js";
 import "./styles.sass";
 import { ServerContext } from "@/common/contexts/ServerContext.jsx";
+import { useLiveSessions } from "@/common/contexts/LiveSessionContext.jsx";
+import AvatarStack from "@/common/components/AvatarStack";
+import { getSessionOwnerLabel } from "@/common/utils/avatar.js";
+import { useTranslation } from "react-i18next";
 import { useContext, useRef, useState } from "react";
 import { useDrag, useDrop } from "react-dnd";
 import { patchRequest } from "@/common/utils/RequestUtil.js";
 import { DropIndicator } from "../DropIndicator";
-import { loadIcon } from "@/pages/Servers/utils/iconMapping.js";
 
 export const ServerObject = ({ id, name, position, folderId, organizationId, nestedLevel, icon, type, connectToServer, status, tags = [], hibernatedSessionCount = 0 }) => {
     const { loadServers, getServerById } = useContext(ServerContext);
+    const { getLiveSessionsForEntry } = useLiveSessions();
+    const { t } = useTranslation();
     const [dropPlacement, setDropPlacement] = useState(null);
     const elementRef = useRef(null);
 
+    const isIntegrationEntry = Boolean(type?.startsWith("pve-"));
+
     const [{ opacity }, dragRef] = useDrag({
-        item: { type: "server", id, folderId, position },
+        item: { type: "server", id, folderId, position, isIntegrationEntry },
         type: "server",
         collect: monitor => ({
             opacity: monitor.isDragging() ? 0.5 : 1,
@@ -23,8 +31,9 @@ export const ServerObject = ({ id, name, position, folderId, organizationId, nes
 
     const [{ isOver }, dropRef] = useDrop({
         accept: "server",
+        canDrop: (item) => item.isIntegrationEntry ? item.folderId === folderId : !isIntegrationEntry,
         hover: (item, monitor) => {
-            if (!elementRef.current || item.id === id) return;
+            if (!elementRef.current || item.id === id || !monitor.canDrop()) return;
             
             const hoverBoundingRect = elementRef.current.getBoundingClientRect();
             const hoverMiddleY = (hoverBoundingRect.bottom - hoverBoundingRect.top) / 2;
@@ -54,15 +63,30 @@ export const ServerObject = ({ id, name, position, folderId, organizationId, nes
             return { id };
         },
         collect: (monitor) => ({
-            isOver: monitor.isOver(),
+            isOver: monitor.isOver() && monitor.canDrop(),
         }),
     });
 
     const server = getServerById(id);
 
+    const liveSessions = getLiveSessionsForEntry(id);
+    const liveSessionOwners = liveSessions.map(session => ({
+        ...session.owner,
+        sessionId: session.id,
+    }));
+    const liveSessionsTitle = liveSessions.length
+        ? t("servers.liveSessions.activeOn", {
+            users: [...new Set(liveSessions.map(s => getSessionOwnerLabel(s, t)))].join(", "),
+        })
+        : undefined;
+
     const connect = () => {
         connectToServer(server.id, server.identities?.[0]);
     };
+
+    const noteLine = server?.showNoteInList
+        ? (server?.notes || "").split(/\r?\n/)[0].trim()
+        : "";
 
     return (
         <div 
@@ -81,15 +105,20 @@ export const ServerObject = ({ id, name, position, folderId, organizationId, nes
                     ? (status === 'offline' || status === 'stopped' ? "pve-icon pve-icon-offline" : "pve-icon")
                     : (status === 'offline' ? "system-icon system-icon-offline" : "system-icon")
             }>
-                <Icon path={loadIcon(icon)} />
+                <Icon path={getIconPath(icon)} />
             </div>
-            <p className="truncate-text">{name}</p>
+            <div className="server-text">
+                <p className="server-name truncate-text">{name}</p>
+                {noteLine && <span className="server-note truncate-text">{noteLine}</span>}
+            </div>
             {hibernatedSessionCount > 0 && (
                 <div className="hibernation-indicator" title={`${hibernatedSessionCount} hibernated session${hibernatedSessionCount > 1 ? 's' : ''}`}>
                     <Icon path={mdiSleep} />
                     <span>{hibernatedSessionCount}</span>
                 </div>
             )}
+            <AvatarStack className="live-session-avatars" users={liveSessionOwners} max={2}
+                         title={liveSessionsTitle} getKey={owner => owner.sessionId} />
             {tags && tags.length > 0 && (
                 <div className="tag-circles">
                     {tags.map(tag => (

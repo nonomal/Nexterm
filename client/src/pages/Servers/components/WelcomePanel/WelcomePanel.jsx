@@ -2,24 +2,17 @@ import "./styles.sass";
 import { useContext, useEffect, useState } from "react";
 import { UserContext } from "@/common/contexts/UserContext.jsx";
 import { ServerContext } from "@/common/contexts/ServerContext.jsx";
-import Button from "@/common/components/Button";
 import Icon from "@mdi/react";
-import {
-    mdiStar,
-    mdiHistory,
-    mdiPower,
-    mdiPlay,
-    mdiServerNetwork,
-    mdiConnection,
-    mdiFolderOpen,
-    mdiCursorDefaultClick,
-} from "@mdi/js";
-import { siDiscord } from "simple-icons";
-import { DISCORD_URL, GITHUB_URL } from "@/App.jsx";
+import { mdiHistory, mdiPower, mdiPlay, mdiServerNetwork, mdiConnection, mdiFolderOpen, mdiCursorDefaultClick, mdiDownload, mdiLinkVariant, mdiWeb } from "@mdi/js";
 import { getRequest } from "@/common/utils/RequestUtil";
 import { useTranslation } from "react-i18next";
 import { ContextMenu, ContextMenuItem, useContextMenu } from "@/common/components/ContextMenu";
-import { loadIcon } from "@/pages/Servers/utils/iconMapping.js";
+import { getIconPath } from "@/common/utils/iconUtils.js";
+import Button from "@/common/components/Button";
+import DownloadAppsDialog from "@/common/components/DownloadAppsDialog";
+import { DeviceLinkDialog } from "@/common/components/DeviceLinkDialog/DeviceLinkDialog.jsx";
+import { getAvatarLabel } from "@/common/utils/avatar.js";
+import { useDrop } from "react-dnd";
 
 const formatTimeAgo = (timestamp) => {
     const diffMins = Math.floor((Date.now() - new Date(timestamp)) / 60000);
@@ -31,7 +24,8 @@ const formatTimeAgo = (timestamp) => {
 
 const PROTOCOL_LABELS = {
     "entry.ssh_connect": "SSH", "entry.sftp_connect": "SFTP", "entry.rdp_connect": "RDP",
-    "entry.vnc_connect": "VNC", "entry.pve_connect": "PVE",
+    "entry.vnc_connect": "VNC",
+    "entry.demo_connect": "Demo", "entry.pve_connect": "PVE",
 };
 
 export const WelcomePanel = ({
@@ -39,6 +33,7 @@ export const WelcomePanel = ({
                                  hibernatedSessions = [],
                                  resumeSession,
                                  openSFTP,
+                                 openBrowser,
                                  openDirectConnect,
                              }) => {
     const { user } = useContext(UserContext);
@@ -47,7 +42,19 @@ export const WelcomePanel = ({
     const [recentConnections, setRecentConnections] = useState([]);
     const [loading, setLoading] = useState(true);
     const [contextItem, setContextItem] = useState(null);
+    const [downloadDialogOpen, setDownloadDialogOpen] = useState(false);
+    const [deviceLinkDialogOpen, setDeviceLinkDialogOpen] = useState(false);
     const contextMenu = useContextMenu();
+
+    const [{ isServerOver }, dropRef] = useDrop({
+        accept: "server",
+        drop: (item) => {
+            const droppedServer = getServerById(item.id);
+            if (droppedServer) connectToServer(droppedServer.id, droppedServer.identities?.[0]);
+            return { handled: true };
+        },
+        collect: (monitor) => ({ isServerOver: monitor.isOver() }),
+    });
 
     useEffect(() => {
         getRequest("/entries/recent?limit=5").then(data => setRecentConnections(data || [])).catch(() => {
@@ -81,6 +88,12 @@ export const WelcomePanel = ({
             contextMenu.close();
         }
     };
+    const connectBrowser = () => {
+        if (server && openBrowser) {
+            openBrowser(server.id, server.identities?.[0] ? { id: server.identities[0] } : null);
+            contextMenu.close();
+        }
+    };
     const quickConnect = () => {
         if (server && openDirectConnect) {
             openDirectConnect(server);
@@ -89,15 +102,13 @@ export const WelcomePanel = ({
     };
 
     return (
-        <div className="welcome-panel">
+        <div className={`welcome-panel${isServerOver ? " drop-target" : ""}`} ref={dropRef}>
             <div className="welcome-left">
-                <h1>Hi, <span>{user?.firstName || "User"} {user?.lastName || ""}</span>!</h1>
-                <p>{t("welcome.subtitle", "Welcome to Nexterm. The open-source server manager for SSH, VNC and RDP.")}</p>
-                <div className="button-area">
-                    <Button text={t("welcome.starOnGitHub", "Star on GitHub")}
-                            onClick={() => window.open(GITHUB_URL, "_blank")} icon={mdiStar} />
-                    <Button text={t("welcome.joinDiscord", "Join Discord")}
-                            onClick={() => window.open(DISCORD_URL, "_blank")} icon={siDiscord.path} />
+                <h1>{t("welcome.hello")}, <span>{getAvatarLabel(user, t("welcome.defaultName"))}</span>!</h1>
+                <p>{t("welcome.subtitle")}</p>
+                <div className="welcome-buttons">
+                    <Button icon={mdiDownload} text={t("welcome.downloadApps")} onClick={() => setDownloadDialogOpen(true)} />
+                    <Button icon={mdiLinkVariant} text={t("welcome.connectDevice")} onClick={() => setDeviceLinkDialogOpen(true)} />
                 </div>
             </div>
 
@@ -110,7 +121,7 @@ export const WelcomePanel = ({
                     <div className="recent-connections">
                         <div className="section-header">
                             <Icon path={mdiHistory} />
-                            <h3>{t("welcome.recentConnections", "Recent Connections")}</h3>
+                            <h3>{t("welcome.recentConnections")}</h3>
                         </div>
                         <div className="recent-list">
                             {recentConnections.map((item, i) => {
@@ -120,7 +131,7 @@ export const WelcomePanel = ({
                                          className={`recent-item${hibernated ? " hibernated" : ""}`}
                                          onClick={() => handleClick(item)}
                                          onContextMenu={(e) => handleContextMenu(e, item)}>
-                                        <div className="item-icon"><Icon path={loadIcon(item.icon)} /></div>
+                                        <div className="item-icon"><Icon path={getIconPath(item.icon)} /></div>
                                         <div className="item-info">
                                             <span className="item-name">{item.name}</span>
                                             <span className="item-meta">
@@ -141,8 +152,8 @@ export const WelcomePanel = ({
                 ) : (
                     <div className="empty-state">
                         <Icon path={mdiServerNetwork} />
-                        <h3>{t("welcome.getStarted", "Get Started")}</h3>
-                        <p>{t("welcome.getStartedHint", "Add a server from the sidebar to begin managing your infrastructure.")}</p>
+                        <h3>{t("welcome.getStarted")}</h3>
+                        <p>{t("welcome.getStartedHint")}</p>
                     </div>
                 )}
             </div>
@@ -157,6 +168,10 @@ export const WelcomePanel = ({
                             <ContextMenuItem icon={mdiFolderOpen} label={t("servers.contextMenu.openSFTP")}
                                              onClick={connectSftp} />
                         )}
+                        {server.protocol === "ssh" && openBrowser && (
+                            <ContextMenuItem icon={mdiWeb} label={t("servers.contextMenu.openBrowser")}
+                                             onClick={connectBrowser} />
+                        )}
                         {openDirectConnect && (
                             <ContextMenuItem icon={mdiCursorDefaultClick} label={t("servers.contextMenu.quickConnect")}
                                              onClick={quickConnect} />
@@ -164,6 +179,9 @@ export const WelcomePanel = ({
                     </>
                 )}
             </ContextMenu>
+
+            <DownloadAppsDialog open={downloadDialogOpen} onClose={() => setDownloadDialogOpen(false)} />
+            <DeviceLinkDialog open={deviceLinkDialogOpen} onClose={() => setDeviceLinkDialogOpen(false)} />
         </div>
     );
 };

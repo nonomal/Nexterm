@@ -3,20 +3,18 @@ import NextermLogo from "@/common/components/NextermLogo";
 import "./styles.sass";
 import Button from "@/common/components/Button";
 import Input from "@/common/components/IconInput";
-import { mdiAccountCircleOutline, mdiKeyOutline, mdiFingerprint, mdiServerNetwork } from "@mdi/js";
-import { useContext, useEffect, useState } from "react";
+import { mdiAccountCircleOutline, mdiKeyOutline, mdiFingerprint, mdiQrcode, mdiArrowLeft } from "@mdi/js";
+import { useContext, useEffect, useRef, useState } from "react";
 import { getRequest, request } from "@/common/utils/RequestUtil.js";
 import { UserContext } from "@/common/contexts/UserContext.jsx";
 import { useToast } from "@/common/contexts/ToastContext.jsx";
 import { useTranslation } from "react-i18next";
 import { startAuthentication } from "@simplewebauthn/browser";
-import { isTauri, getActiveServerUrl, setActiveServerUrl as saveServerUrl } from "@/common/utils/TauriUtil.js";
+import { getProviderIcon } from "@/common/utils/iconUtils";
+import { QRCodeCanvas } from "qrcode.react";
 
 export const LoginDialog = ({ open }) => {
     const { t } = useTranslation();
-    const isConnectorMode = isTauri();
-    const [serverUrl, setServerUrl] = useState(getActiveServerUrl() || "");
-    const [serverConnected, setServerConnected] = useState(!!getActiveServerUrl());
 
     const [username, setUsername] = useState("");
     const [password, setPassword] = useState("");
@@ -25,7 +23,14 @@ export const LoginDialog = ({ open }) => {
     const [code, setCode] = useState("");
     const [providers, setProviders] = useState([]);
     const [internalAuthEnabled, setInternalAuthEnabled] = useState(true);
+    const [registrationEnabled, setRegistrationEnabled] = useState(false);
+    const [registerMode, setRegisterMode] = useState(false);
     const [passkeyLoading, setPasskeyLoading] = useState(false);
+
+    const [qrMode, setQrMode] = useState(false);
+    const [qrCode, setQrCode] = useState(null);
+    const [qrLoading, setQrLoading] = useState(false);
+    const pollTimerRef = useRef(null);
 
     const { sendToast } = useToast();
 
@@ -33,22 +38,23 @@ export const LoginDialog = ({ open }) => {
 
     const { updateSessionToken, firstTimeSetup } = useContext(UserContext);
 
+    const registrationView = firstTimeSetup || registerMode;
+
     const isInternalAuthEnabled = () => {
-        if (firstTimeSetup) return true;
+        if (registrationView) return true;
         return internalAuthEnabled;
     };
 
     const loadProviders = async () => {
-        if (isConnectorMode && !serverConnected) return;
-        
         try {
-            const providers = await getRequest("oidc/providers");
+            const providers = await getRequest("auth/providers");
 
             const internalProvider = providers.find(p => p.isInternal);
             const externalProviders = providers.filter(p => !p.isInternal && p.enabled);
             
-            const internalAuthEnabled = internalProvider ? internalProvider.enabled : false;
+            const internalAuthEnabled = internalProvider ? Boolean(internalProvider.enabled) : false;
             setInternalAuthEnabled(internalAuthEnabled);
+            setRegistrationEnabled(internalProvider ? Boolean(internalProvider.allowRegistration) : false);
             setProviders(externalProviders);
 
             if (!firstTimeSetup && externalProviders.length === 1 && !internalAuthEnabled) {
@@ -57,23 +63,23 @@ export const LoginDialog = ({ open }) => {
                 }, 300);
             }
         } catch (error) {
-            if (isConnectorMode) {
-                sendToast("Error", "Failed to connect to server. Please check the URL.");
-            } else {
-                sendToast("Error", t('common.errors.loadingAuthProviders', { error: error }));
-            }
+            sendToast("Error", t('common.errors.loadingAuthProviders', { error: error }));
         }
     };
 
     useEffect(() => {
-        if (open && (!isConnectorMode || serverConnected)) {
+        if (open) {
             loadProviders();
         }
-    }, [open, serverConnected]);
+    }, [open]);
 
     const createAccountFirst = async () => {
         try {
-            await request("accounts/register", "POST", { username, password, firstName, lastName });
+            const result = await request("accounts/register", "POST", { username, password, firstName, lastName });
+            if (result?.code) {
+                sendToast("Error", result.message || t('common.errors.generalError'));
+                return false;
+            }
             return true;
         } catch (error) {
             sendToast("Error", error.message || t('common.errors.generalError'));
@@ -84,27 +90,12 @@ export const LoginDialog = ({ open }) => {
     const submit = async (event) => {
         event.preventDefault();
 
-        if (isConnectorMode && serverUrl && serverUrl.trim()) {
-            const cleanUrl = serverUrl.trim().replace(/\/$/, "");
-            saveServerUrl(cleanUrl);
-
-            if (!serverConnected) {
-                setServerConnected(true);
-                return;
-            }
-        }
-
-        if (isConnectorMode && !serverUrl) {
-            sendToast("Error", "Please enter a server URL first");
-            return;
-        }
-
         if (!isInternalAuthEnabled()) {
             sendToast("Error", t('common.errors.internalAuthDisabled'));
             return;
         }
 
-        if (firstTimeSetup && !await createAccountFirst()) return;
+        if (registrationView && !await createAccountFirst()) return;
 
         let resultObj;
         try {
@@ -134,7 +125,7 @@ export const LoginDialog = ({ open }) => {
         }
 
         try {
-            const response = await request("oidc/login/" + providerId, "POST");
+            const response = await request("auth/oidc/login/" + providerId, "POST");
             if (response.url) {
                 window.location.href = response.url;
             }
@@ -183,29 +174,73 @@ export const LoginDialog = ({ open }) => {
         }
     };
 
+    const stopPolling = () => {
+        if (pollTimerRef.current) { clearInterval(pollTimerRef.current); pollTimerRef.current = null; }
+    };
+
+    const startQrLogin = async () => {
+        setQrLoading(true);
+        try {
+            const result = await request("auth/device/create", "POST", { clientType: "web" });
+            if (result?.code && typeof result.code === "number") {
+                sendToast("Error", result.message || t('common.errors.generalError'));
+                return;
+            }
+            setQrCode(result.code);
+            setQrMode(true);
+            stopPolling();
+            pollTimerRef.current = setInterval(async () => {
+                try {
+                    const poll = await request("auth/device/poll", "POST", { token: result.token });
+                    if (poll.status === "authorized" && poll.token) { stopPolling(); updateSessionToken(poll.token); }
+                    else if (poll.status === "invalid") { stopPolling(); setQrCode(null); setQrMode(false); sendToast("Error", t('common.errors.qrCodeExpired')); }
+                } catch (_) {}
+            }, 3000);
+        } catch (error) {
+            sendToast("Error", error.message || t('common.errors.generalError'));
+        } finally { setQrLoading(false); }
+    };
+
+    const exitQrMode = () => { stopPolling(); setQrMode(false); setQrCode(null); };
+
+    useEffect(() => () => stopPolling(), []);
+
+    const getQrValue = () => `nexterm://authorize?code=${qrCode}&server=${encodeURIComponent(window.location.origin)}`;
+
     return (
         <DialogProvider disableClosing open={open}>
-            <div className="login-dialog">
+            <div className={"login-dialog" + (qrMode ? " qr-mode" : "")}>
                 <div className="login-logo">
                     <NextermLogo size={48} />
-                    <h1>{firstTimeSetup ? t('common.loginDialog.registrationTitle') : t('common.loginDialog.title')}</h1>
+                    <h1>{registrationView ? t('common.loginDialog.registrationTitle') : t('common.loginDialog.title')}</h1>
                 </div>
-                <form className="login-form" onSubmit={submit}>
-                    {isConnectorMode && (
-                        <div className="form-group server-url-group">
-                            <label htmlFor="serverUrl">Server URL</label>
-                            <Input 
-                                type="text" 
-                                id="serverUrl" 
-                                icon={mdiServerNetwork}
-                                placeholder="https://nexterm.example.com" 
-                                value={serverUrl} 
-                                setValue={setServerUrl}
-                            />
-                        </div>
-                    )}
 
-                    {firstTimeSetup ? (
+                {qrMode ? (
+                    <div className="qr-login-container">
+                        <p className="qr-login-description">{t('common.loginDialog.qrScanDescription')}</p>
+                        <div className="qr-code-wrapper">
+                            {qrCode ? (
+                                <QRCodeCanvas
+                                    value={getQrValue()}
+                                    size={200}
+                                    bgColor="transparent"
+                                    fgColor="#ffffff"
+                                    level="M"
+                                />
+                            ) : null}
+                        </div>
+                        <div className="qr-device-code">{qrCode}</div>
+                        <Button
+                            type="secondary"
+                            icon={mdiArrowLeft}
+                            text={t('common.loginDialog.backToLogin')}
+                            onClick={exitQrMode}
+                            buttonType="button"
+                        />
+                    </div>
+                ) : (
+                <form className="login-form" onSubmit={submit}>
+                    {registrationView ? (
                         <div className="register-name-row">
                             <div className="form-group">
                                 <label htmlFor="firstName">{t('common.labels.firstName')}</label>
@@ -241,24 +276,41 @@ export const LoginDialog = ({ open }) => {
                     ) : null}
 
                     {totpRequired ? (
-                        <>
-                            <div className="form-group">
-                                <label htmlFor="code">{t('common.labels.twoFACode')}</label>
-                                <Input type="number" id="code" required icon={mdiKeyOutline}
-                                       placeholder={t('common.placeholders.code')} autoComplete="one-time-code"
-                                       value={code} setValue={setCode} />
-                            </div>
-                        </>
+                        <div className="form-group">
+                            <label htmlFor="code">{t('common.labels.twoFACode')}</label>
+                            <Input type="number" id="code" required icon={mdiKeyOutline}
+                                   placeholder={t('common.placeholders.code')} autoComplete="one-time-code"
+                                   value={code} setValue={setCode} />
+                        </div>
                     ) : null}
 
-                    {isInternalAuthEnabled() ? <Button text={firstTimeSetup ? t('common.actions.register') : t('common.actions.login')} /> : null}
+                    {isInternalAuthEnabled() ? <Button text={registrationView ? t('common.actions.register') : t('common.actions.login')} /> : null}
 
-                    {(!firstTimeSetup && !totpRequired) ? (
+                    {(registrationEnabled && !firstTimeSetup && !totpRequired) ? (
+                        <div className="register-switch">
+                            <span>{registerMode ? t('common.loginDialog.haveAccount') : t('common.loginDialog.noAccount')}</span>
+                            <button type="button" onClick={() => setRegisterMode(!registerMode)}>
+                                {registerMode ? t('common.actions.login') : t('common.actions.register')}
+                            </button>
+                        </div>
+                    ) : null}
+
+                    {(!registrationView && !totpRequired) ? (
                         <div className="sso-options">
-                            <div className="divider">
-                                <span>{t('common.loginDialog.ssoOrContinueWith')}</span>
-                            </div>
+                            {isInternalAuthEnabled() && (
+                                <div className="divider">
+                                    <span>{t('common.loginDialog.ssoOrContinueWith')}</span>
+                                </div>
+                            )}
                             <div className="sso-buttons">
+                                <Button
+                                    type="secondary"
+                                    icon={mdiQrcode}
+                                    text={qrLoading ? t('common.loginDialog.authenticating') : t('common.loginDialog.signInWithQrCode')}
+                                    onClick={startQrLogin}
+                                    disabled={qrLoading}
+                                    buttonType="button"
+                                />
                                 <Button
                                     type="secondary"
                                     icon={mdiFingerprint}
@@ -268,21 +320,24 @@ export const LoginDialog = ({ open }) => {
                                     buttonType="button"
                                 />
                                 {providers.map(provider => (
-                                    <Button
-                                        key={provider.id}
-                                        type="secondary"
-                                        text={provider.name}
-                                        onClick={(e) => handleOIDCLogin(e, provider.id)}
-                                    />
+                                <Button
+                                    key={provider.id}
+                                    type="secondary"
+                                    icon={getProviderIcon(provider)}
+                                    text={provider.name}
+                                    onClick={(e) => handleOIDCLogin(e, provider.id)}
+                                    buttonType="button"
+                                />
                                 ))}
                             </div>
                         </div>
                     ) : null}
 
-                    {(!firstTimeSetup && !isInternalAuthEnabled() && providers.length === 0) ? (
+                    {(!registrationView && !isInternalAuthEnabled() && providers.length === 0) ? (
                         <p>{t('common.loginDialog.noAuthMethodsAvailable')}</p>
                     ) : null}
                 </form>
+                )}
             </div>
         </DialogProvider>
     );

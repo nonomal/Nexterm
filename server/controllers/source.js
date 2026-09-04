@@ -1,13 +1,17 @@
 const Source = require("../models/Source");
 const Snippet = require("../models/Snippet");
 const Script = require("../models/Script");
+const Theme = require("../models/Theme");
 const crypto = require("crypto");
 const logger = require("../utils/logger");
+const { assertPublicUrl } = require("../utils/ssrf");
 
 module.exports.validateSourceUrl = async (url) => {
     try {
         const baseUrl = url.replace(/\/$/, "");
         const indexUrl = `${baseUrl}/NTINDEX`;
+
+        await assertPublicUrl(indexUrl);
 
         const response = await fetch(indexUrl, {
             method: "GET",
@@ -24,7 +28,7 @@ module.exports.validateSourceUrl = async (url) => {
         const indexContent = await response.text();
         const parsedIndex = parseNTINDEX(indexContent);
 
-        if (!parsedIndex.snippets.length && !parsedIndex.scripts.length) {
+        if (!parsedIndex.snippets.length && !parsedIndex.scripts.length && !parsedIndex.themes.length) {
             return { valid: false, error: "NTINDEX is empty or invalid" };
         }
 
@@ -41,15 +45,23 @@ const parseNTINDEX = (content) => {
     const lines = content.split("\n").filter(line => line.trim() && !line.startsWith("#"));
     const snippets = [];
     const scripts = [];
+    const themes = [];
 
     const scriptExtensions = [".sh", ".bash", ".zsh", ".fish", ".ps1"];
     const snippetExtensions = [".txt", ".snippet", ".cmd"];
+    const themeExtension = ".theme.css";
 
     for (const line of lines) {
         const parts = line.split("@").map(p => p.trim());
         if (parts.length < 2) continue;
 
         const [path, hash] = parts;
+
+        if (path.toLowerCase().endsWith(themeExtension)) {
+            themes.push({ hash, path });
+            continue;
+        }
+
         const ext = path.substring(path.lastIndexOf(".")).toLowerCase();
         const entry = { hash, path };
 
@@ -60,11 +72,10 @@ const parseNTINDEX = (content) => {
         }
     }
 
-    return { snippets, scripts };
+    return { snippets, scripts, themes };
 };
 
 const calculateContentHash = (content) => crypto.createHash("md5").update(content).digest("hex");
-
 
 const reconstructSnippetFile = (snippet) => {
     let content = "";
@@ -161,6 +172,7 @@ module.exports.deleteSource = async (sourceId) => {
 
     await Snippet.destroy({ where: { sourceId } });
     await Script.destroy({ where: { sourceId } });
+    await Theme.destroy({ where: { sourceId } });
 
     await Source.destroy({ where: { id: sourceId } });
 };
@@ -186,19 +198,23 @@ module.exports.syncSource = async (sourceId) => {
             return { success: false, error: validation.error };
         }
 
-        const { snippets: indexSnippets, scripts: indexScripts } = validation.index;
+        const { snippets: indexSnippets, scripts: indexScripts, themes: indexThemes } = validation.index;
 
         const existingSnippets = await Snippet.findAll({ where: { sourceId } });
         const existingScripts = await Script.findAll({ where: { sourceId } });
+        const existingThemes = await Theme.findAll({ where: { sourceId } });
 
         const existingSnippetMap = new Map(existingSnippets.map(s => [s.name, s]));
         const existingScriptMap = new Map(existingScripts.map(s => [s.name, s]));
+        const existingThemeMap = new Map(existingThemes.map(t => [t.name, t]));
 
         let snippetCount = 0;
         let scriptCount = 0;
+        let themeCount = 0;
 
         const processedSnippetNames = new Set();
         const processedScriptNames = new Set();
+        const processedThemeNames = new Set();
 
         for (const indexSnippet of indexSnippets) {
             let existingByHash = null;
@@ -234,12 +250,14 @@ module.exports.syncSource = async (sourceId) => {
                     name: parsed.name,
                     command: parsed.command,
                     description: parsed.description,
+                    osFilter: parsed.osFilter,
                 }, { where: { id: existing.id } });
             } else {
                 await Snippet.create({
                     name: parsed.name,
                     command: parsed.command,
                     description: parsed.description,
+                    osFilter: parsed.osFilter,
                     accountId: null,
                     organizationId: null,
                     sourceId,
@@ -281,18 +299,65 @@ module.exports.syncSource = async (sourceId) => {
                     name: parsed.name,
                     content: parsed.content,
                     description: parsed.description,
+                    osFilter: parsed.osFilter,
                 }, { where: { id: existing.id } });
             } else {
                 await Script.create({
                     name: parsed.name,
                     content: parsed.content,
                     description: parsed.description,
+                    osFilter: parsed.osFilter,
                     accountId: null,
                     organizationId: null,
                     sourceId,
                 });
             }
             scriptCount++;
+        }
+
+        for (const indexTheme of indexThemes) {
+            let existingByHash = null;
+            for (const [name, theme] of existingThemeMap) {
+                const existingHash = calculateContentHash(theme.css);
+                if (existingHash === indexTheme.hash) {
+                    existingByHash = theme;
+                    processedThemeNames.add(name);
+                    break;
+                }
+            }
+
+            if (existingByHash) {
+                themeCount++;
+                continue;
+            }
+
+            const content = await fetchSourceFile(source.url, indexTheme.path);
+            if (!content) {
+                logger.warn(`Failed to fetch theme: ${indexTheme.path}`);
+                continue;
+            }
+
+            const parsed = parseThemeContent(content, indexTheme.path);
+            const existing = existingThemeMap.get(parsed.name);
+
+            processedThemeNames.add(parsed.name);
+
+            if (existing) {
+                await Theme.update({
+                    name: parsed.name,
+                    css: parsed.css,
+                    description: parsed.description,
+                }, { where: { id: existing.id } });
+            } else {
+                await Theme.create({
+                    name: parsed.name,
+                    css: parsed.css,
+                    description: parsed.description,
+                    accountId: null,
+                    sourceId,
+                });
+            }
+            themeCount++;
         }
 
         for (const [name, snippet] of existingSnippetMap) {
@@ -305,14 +370,20 @@ module.exports.syncSource = async (sourceId) => {
                 await Script.destroy({ where: { id: script.id } });
             }
         }
+        for (const [name, theme] of existingThemeMap) {
+            if (!processedThemeNames.has(name)) {
+                await Theme.destroy({ where: { id: theme.id } });
+            }
+        }
 
         await Source.update({
             lastSyncStatus: "success",
             snippetCount,
             scriptCount,
+            themeCount,
         }, { where: { id: sourceId } });
 
-        logger.info(`Source sync completed: ${source.name} - ${snippetCount} snippets, ${scriptCount} scripts`);
+        logger.info(`Source sync completed: ${source.name} - ${snippetCount} snippets, ${scriptCount} scripts, ${themeCount} themes`);
         return { success: true };
 
     } catch (error) {
@@ -335,6 +406,7 @@ module.exports.syncAllSources = async () => {
 const fetchSourceFile = async (baseUrl, path) => {
     try {
         const url = `${baseUrl}/${path}`;
+        await assertPublicUrl(url);
         const response = await fetch(url, {
             method: "GET",
             headers: {
@@ -357,6 +429,7 @@ const parseSnippetContent = (content, defaultName) => {
     const lines = content.split("\n");
     let name = defaultName;
     let description = "";
+    let osFilter = [];
     const commandLines = [];
 
     for (const line of lines) {
@@ -372,6 +445,12 @@ const parseSnippetContent = (content, defaultName) => {
             continue;
         }
 
+        const osLine = line.match(/^#\s*@os:\s*(.+)$/i);
+        if (osLine) {
+            osFilter = osLine[1].split(',').map(s => s.trim()).filter(Boolean);
+            continue;
+        }
+
         if (line.startsWith("#") && commandLines.length === 0) {
             continue;
         }
@@ -383,6 +462,7 @@ const parseSnippetContent = (content, defaultName) => {
         name,
         command: commandLines.join("\n").trim(),
         description,
+        osFilter: osFilter.length > 0 ? osFilter : null,
     };
 };
 
@@ -390,6 +470,7 @@ const parseScriptContent = (content, defaultName) => {
     const lines = content.split("\n");
     let name = defaultName;
     let description = "";
+    let osFilter = [];
 
     for (const line of lines) {
         const nameLine = line.match(/^#\s*@name:\s*(.+)$/i);
@@ -401,11 +482,43 @@ const parseScriptContent = (content, defaultName) => {
         const descLine = line.match(/^#\s*@description:\s*(.+)$/i);
         if (descLine) {
             description = descLine[1].trim();
-            break;
+            continue;
         }
+
+        const osLine = line.match(/^#\s*@os:\s*(.+)$/i);
+        if (osLine) {
+            osFilter = osLine[1].split(',').map(s => s.trim()).filter(Boolean);
+            continue;
+        }
+
+        if (!line.startsWith("#")) break;
     }
 
-    return { name, content: content, description };
+    return { name, content, description, osFilter: osFilter.length > 0 ? osFilter : null };
+};
+
+const parseThemeContent = (content, path) => {
+    const lines = content.split("\n");
+    let name = path.split("/").pop().replace(/\.theme\.css$/i, "");
+    let description = "";
+
+    for (const line of lines) {
+        const nameLine = line.match(/^\/\*\s*@name:\s*(.+?)\s*\*\/$/i) || line.match(/^\s*\/\*\*?\s*@name:\s*(.+?)\s*\*?\*?\/?\s*$/i);
+        if (nameLine) {
+            name = nameLine[1].trim();
+            continue;
+        }
+
+        const descLine = line.match(/^\/\*\s*@description:\s*(.+?)\s*\*\/$/i) || line.match(/^\s*\/\*\*?\s*@description:\s*(.+?)\s*\*?\*?\/?\s*$/i);
+        if (descLine) {
+            description = descLine[1].trim();
+            continue;
+        }
+
+        if (!line.trim().startsWith("/*") && !line.trim().startsWith("*") && line.trim()) break;
+    }
+
+    return { name, css: content, description };
 };
 
 module.exports.ensureDefaultSource = async () => {

@@ -1,32 +1,27 @@
 import i18n from "i18next";
 import {initReactI18next} from "react-i18next";
-import LanguageDetector from 'i18next-browser-languagedetector';
 import HttpApi from 'i18next-http-backend';
-
-if (localStorage.getItem('language') === null)
-    localStorage.setItem('language', navigator.language.split('-')[0]);
 
 export const languages = [
     {name: 'English', code: 'en'},
-    {name: 'Deutsch', code: 'de'},
-    {name: 'Español', code: 'es'},
-    {name: 'Français', code: 'fr'},
-    {name: 'Italiano', code: 'it'},
-    {name: 'Русский', code: 'ru'},
-    {name: 'Português-Brasil', code: 'pt-BR'},
-    {name: '中文', code: 'zh'},
+    {name: 'Čeština', code: 'cs_CZ'},
+    {name: 'Deutsch', code: 'de_DE'},
+    {name: 'Español', code: 'es_ES'},
+    {name: 'Français', code: 'fr_FR'},
+    {name: 'Italiano', code: 'it_IT'},
+    {name: 'Русский', code: 'ru_RU'},
+    {name: 'Português-Brasil', code: 'pt_BR'},
+    {name: '简体中文', code: 'zh_CN'},
+    {name: '繁體中文', code: 'zh_TW'},
 ]
 
-i18n.use(initReactI18next).use(LanguageDetector).use(HttpApi).init({
+i18n.use(initReactI18next).use(HttpApi).init({
+    lng: navigator.language.replace('-', '_'),
     supportedLngs: languages.map(lang => lang.code),
     fallbackLng: 'en',
     backend: {
         loadPath: '/assets/locales/{{lng}}.json'
     },
-    detection: {
-        order: ['localStorage'],
-        lookupLocalStorage: 'language'
-    }
 });
 
 export default i18n;
